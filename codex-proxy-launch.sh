@@ -26,6 +26,7 @@ log_command() {
 }
 
 log_debug "launcher started"
+CURRENT_PID="$$"
 
 redact_proxy_url() {
   print -r -- "$1" | /usr/bin/sed -E 's#(socks5h?://)[^/@]+@#\1***@#; s#(https?://)[^/@]+@#\1***@#'
@@ -224,6 +225,20 @@ proxy_name_exists_except() {
     [[ "$(proxy_name "${item}")" == "${name}" ]] && return 0
   done
   return 1
+}
+
+cleanup_stale_proxy_helpers() {
+  local pid command
+  for pid in "${(@f)$("/usr/bin/pgrep" -f "codex-proxy-launch.sh|socks-http-bridge.mjs" 2>/dev/null || true)}"; do
+    [[ -n "${pid}" ]] || continue
+    [[ "${pid}" != "${CURRENT_PID}" ]] || continue
+    command="$(/bin/ps -p "${pid}" -o command= 2>/dev/null || true)"
+    [[ -n "${command}" ]] || continue
+    if [[ "${command}" == *"codex-proxy-launch.sh"* || "${command}" == *"socks-http-bridge.mjs"* ]]; then
+      log_debug "stopping stale proxy helper ${pid}: ${command}"
+      /bin/kill "${pid}" >/dev/null 2>&1 || true
+    fi
+  done
 }
 
 generate_proxy_id() {
@@ -623,6 +638,7 @@ if [[ "${CODEX_PROXY_SKIP_UI:-0}" != "1" ]]; then
   select_active_proxy
   log_debug "active proxy after UI: ${ACTIVE_PROXY}"
 fi
+cleanup_stale_proxy_helpers
 
 PROXY_HOST="$(proxy_host "${ACTIVE_PROXY}")"
 PROXY_PORT="$(proxy_port "${ACTIVE_PROXY}")"
@@ -753,23 +769,13 @@ codex_is_running() {
   [[ -n "$(codex_process_pids)" ]]
 }
 
-tracked_codex_is_running() {
-  local pid
-  for pid in "${TRACKED_CODEX_PIDS[@]:-}"; do
-    [[ -n "${pid}" ]] || continue
-    /bin/kill -0 "${pid}" >/dev/null 2>&1 && return 0
-  done
-  return 1
-}
-
 log_debug "open args: $(redact_proxy_url "${CODEX_ARGS[*]}")"
 /usr/bin/open -n /Applications/Codex.app --args "${CODEX_ARGS[@]}"
 OPEN_STATUS=$?
 log_debug "open status: ${OPEN_STATUS}"
 sleep 2
-TRACKED_CODEX_PIDS=("${(@f)$(codex_process_pids)}")
-log_debug "tracked Codex pids after open: $(join_by " " "${TRACKED_CODEX_PIDS[@]}")"
-for pid in "${TRACKED_CODEX_PIDS[@]}"; do
+log_debug "Codex pids after open: $(join_by " " "${(@f)$(codex_process_pids)}")"
+for pid in "${(@f)$(codex_process_pids)}"; do
   log_command "Codex process ${pid}" /bin/ps -p "${pid}" -o pid=,comm=
 done
 
@@ -783,12 +789,10 @@ cleanup_launch_env() {
 
 if [[ "${OPEN_STATUS}" -eq 0 ]]; then
   for _ in {1..60}; do
-    (( ${#TRACKED_CODEX_PIDS[@]} > 0 )) && break
-    TRACKED_CODEX_PIDS=("${(@f)$(codex_process_pids)}")
+    codex_is_running && break
     sleep 0.5
   done
-  log_debug "final tracked Codex pids: $(join_by " " "${TRACKED_CODEX_PIDS[@]}")"
-  while tracked_codex_is_running; do
+  while codex_is_running; do
     sleep 5
   done
 fi
