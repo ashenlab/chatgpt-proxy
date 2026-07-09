@@ -87,9 +87,9 @@ fc00::/7
 fe80::/10
 ```
 
-## 开源注意
+## 隐私与配置文件
 
-不要提交你的真实 `codex-proxy.conf`。其中可能包含私有代理地址、内网域名或个人网络信息。仓库应只提交 `codex-proxy.conf.example`。
+真实代理配置保存在本机的 `codex-proxy.conf` 中，可能包含私有代理地址、内网域名或个人网络信息。这个文件已被 `.gitignore` 忽略，仓库只提供 `codex-proxy.conf.example` 作为公开模板。
 
 ## 构建
 
