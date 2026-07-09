@@ -273,6 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let portField = NSTextField()
     private let usernameField = NSTextField()
     private let passwordField = NSSecureTextField()
+    private let authCheck = NSButton(checkboxWithTitle: "Use authentication", target: nil, action: nil)
     private let bridgeCheck = NSButton(checkboxWithTitle: "Use local HTTP bridge", target: nil, action: nil)
     private let bridgeHelpButton = NSButton()
     private let currentLabel = NSTextField(labelWithString: "")
@@ -300,6 +301,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let saveButton = NSButton()
     private let launchButton = NSButton()
     private let statusLabel = NSTextField(labelWithString: "")
+    private var usernameRow: NSGridRow?
+    private var passwordRow: NSGridRow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -329,6 +332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "socksPort": "SOCKS Port",
             "username": "Username",
             "password": "Password",
+            "useAuth": "Use authentication",
             "bridgeHost": "Bridge Host",
             "bridgePort": "Bridge Port",
             "useBridge": "Use local HTTP bridge",
@@ -374,6 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "socksPort": "SOCKS 端口",
             "username": "用户名",
             "password": "密码",
+            "useAuth": "需要认证",
             "bridgeHost": "Bridge 主机",
             "bridgePort": "Bridge 端口",
             "useBridge": "启用本地 HTTP bridge",
@@ -422,6 +427,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         portLabel.stringValue = tr("socksPort")
         usernameLabel.stringValue = tr("username")
         passwordLabel.stringValue = tr("password")
+        authCheck.title = tr("useAuth")
         bridgeHostLabel.stringValue = tr("bridgeHost")
         bridgePortLabel.stringValue = tr("bridgePort")
         bridgeCheck.title = tr("useBridge")
@@ -554,12 +560,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             [nameLabel, nameField],
             [hostLabel, hostField],
             [portLabel, portField],
+            [NSView(), authCheck],
             [usernameLabel, usernameField],
             [passwordLabel, passwordField],
             [bridgeHostLabel, bridgeHostField],
             [bridgePortLabel, bridgePortField],
             [NSView(), bridgeRow]
         ])
+        usernameRow = form.row(at: 4)
+        passwordRow = form.row(at: 5)
         for field in [nameLabel, hostLabel, portLabel, usernameLabel, passwordLabel, bridgeHostLabel, bridgePortLabel] {
             field.textColor = .secondaryLabelColor
         }
@@ -571,8 +580,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             field.target = self
             field.action = #selector(fieldsChanged)
         }
+        authCheck.target = self
+        authCheck.action = #selector(authToggled)
         bridgeCheck.target = self
         bridgeCheck.action = #selector(fieldsChanged)
+        updateAuthRows()
 
         let right = NSStackView()
         right.orientation = .vertical
@@ -656,6 +668,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         portField.stringValue = proxy.port
         usernameField.stringValue = proxy.username
         passwordField.stringValue = proxy.password
+        authCheck.state = (proxy.username.isEmpty && proxy.password.isEmpty) ? .off : .on
+        updateAuthRows()
         bridgeCheck.state = proxy.bridge ? .on : .off
         bridgeHostField.stringValue = config.httpBridgeHost
         bridgePortField.stringValue = config.httpBridgePort
@@ -677,8 +691,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         config.proxies[index].name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         config.proxies[index].host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         config.proxies[index].port = portField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        config.proxies[index].username = usernameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        config.proxies[index].password = passwordField.stringValue
+        if authCheck.state == .on {
+            config.proxies[index].username = usernameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            config.proxies[index].password = passwordField.stringValue
+        } else {
+            config.proxies[index].username = ""
+            config.proxies[index].password = ""
+        }
         config.proxies[index].bridge = bridgeCheck.state == .on
         config.httpBridgeHost = bridgeHostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         config.httpBridgePort = bridgePortField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -708,6 +727,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         alert.informativeText = tr("bridgeHelp")
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+
+    private func updateAuthRows() {
+        let visible = authCheck.state == .on
+        usernameRow?.isHidden = !visible
+        passwordRow?.isHidden = !visible
+    }
+
+    @objc private func authToggled() {
+        if authCheck.state != .on {
+            usernameField.stringValue = ""
+            passwordField.stringValue = ""
+        }
+        updateAuthRows()
+        fieldsChanged()
     }
 
     @objc private func fieldsChanged() {

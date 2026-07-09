@@ -108,6 +108,6 @@ CLANG_MODULE_CACHE_PATH=.build/clang-module-cache \
 
 Codex Proxy is a small macOS launcher for starting Codex Desktop with per-app proxy settings. It lets Codex use a SOCKS5 proxy without changing the system proxy, enabling a global VPN, or routing other applications through proxy/splitting software.
 
-It supports multiple SOCKS5 profiles with optional username/password authentication, an optional local HTTP CONNECT bridge, an editable bypass list, English/Chinese UI switching, and a prompt for relaunching Codex when it is already running.
+It supports multiple SOCKS5 profiles with optional username/password authentication, an optional local HTTP CONNECT bridge, an editable bypass list, English/Chinese UI switching, and a prompt for relaunching Codex when it is already running. Username and password fields are hidden by default; enable **Use authentication** only when your SOCKS5 server requires credentials.
 
 Use `codex-proxy.conf.example` as the public template. Keep your real `codex-proxy.conf` private.
