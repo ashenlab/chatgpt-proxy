@@ -9,6 +9,7 @@ EXAMPLE_CONFIG_FILE="${CHATGPT_PROXY_EXAMPLE_CONFIG_FILE:-${SCRIPT_DIR}/chatgpt-
 DEBUG_LOG_FILE="${SUPPORT_DIR}/chatgpt-proxy-debug.log"
 BRIDGE_PID=""
 LAUNCH_ENV_ACTIVE=0
+LAUNCH_ENV_MARKER="CHATGPT_PROXY_HANDOFF_URL"
 LAUNCH_ENV_VARS=(
   ALL_PROXY
   HTTP_PROXY
@@ -43,22 +44,106 @@ log_command() {
 
 log_debug "launcher started"
 
+clear_launch_env() {
+  local var failed=0
+  for var in "${LAUNCH_ENV_VARS[@]}"; do
+    if /bin/launchctl unsetenv "${var}" >/dev/null 2>&1; then
+      log_debug "launchctl unsetenv ${var}"
+    else
+      log_debug "launchctl unsetenv ${var} failed"
+      failed=1
+    fi
+  done
+  if /bin/launchctl unsetenv "${LAUNCH_ENV_MARKER}" >/dev/null 2>&1; then
+    log_debug "launchctl unsetenv ${LAUNCH_ENV_MARKER}"
+  else
+    log_debug "launchctl unsetenv ${LAUNCH_ENV_MARKER} failed"
+    failed=1
+  fi
+
+  if [[ "${failed}" == "0" ]]; then
+    LAUNCH_ENV_ACTIVE=0
+    return 0
+  fi
+  return 1
+}
+
+clear_stale_handoff_env() {
+  local marker legacy_url current_proxy
+  marker="$(/bin/launchctl getenv "${LAUNCH_ENV_MARKER}" 2>/dev/null || true)"
+  legacy_url="http://$(proxy_url_host "${HTTP_BRIDGE_HOST:-127.0.0.1}"):${HTTP_BRIDGE_PORT:-28083}"
+  current_proxy="$(/bin/launchctl getenv HTTP_PROXY 2>/dev/null || true)"
+
+  if [[ -n "${marker}" || "${current_proxy}" == "${legacy_url}" ]]; then
+    log_debug "clearing stale ChatGPT Proxy launchctl handoff"
+    LAUNCH_ENV_ACTIVE=1
+    clear_launch_env
+  fi
+}
+
+launch_env_is_clean() {
+  local var value
+  for var in "${LAUNCH_ENV_VARS[@]}"; do
+    value="$(/bin/launchctl getenv "${var}" 2>/dev/null || true)"
+    if [[ -n "${value}" ]]; then
+      log_debug "launchctl ${var} already exists; skipping global handoff"
+      return 1
+    fi
+  done
+  return 0
+}
+
+begin_launch_env_handoff() {
+  local var
+  if ! launch_env_is_clean; then
+    return 0
+  fi
+
+  LAUNCH_ENV_ACTIVE=1
+  if ! /bin/launchctl setenv "${LAUNCH_ENV_MARKER}" "chatgpt-proxy:$$" >/dev/null 2>&1; then
+    log_debug "launchctl setenv ${LAUNCH_ENV_MARKER} failed"
+    clear_launch_env || true
+    return 1
+  fi
+
+  for var in "${LAUNCH_ENV_VARS[@]}"; do
+    if ! /bin/launchctl setenv "${var}" "${(P)var}" >/dev/null 2>&1; then
+      log_debug "launchctl setenv ${var} failed"
+      clear_launch_env || true
+      return 1
+    fi
+    log_debug "launchctl setenv ${var}=$(redact_proxy_url "${(P)var}")"
+  done
+  return 0
+}
+
+stop_bridge() {
+  local pid="${BRIDGE_PID}"
+  local attempt
+  [[ -n "${pid}" ]] || return 0
+
+  log_debug "stopping bridge ${pid}"
+  /bin/kill -TERM "${pid}" >/dev/null 2>&1 || true
+  for attempt in {1..20}; do
+    /bin/kill -0 "${pid}" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  if /bin/kill -0 "${pid}" >/dev/null 2>&1; then
+    log_debug "bridge ${pid} did not stop after SIGTERM; sending SIGKILL"
+    /bin/kill -KILL "${pid}" >/dev/null 2>&1 || true
+  fi
+  wait "${pid}" >/dev/null 2>&1 || true
+  BRIDGE_PID=""
+}
+
 cleanup_launcher() {
   local status=$?
-  local var
   trap - EXIT
 
   if [[ "${LAUNCH_ENV_ACTIVE}" == "1" ]]; then
-    for var in "${LAUNCH_ENV_VARS[@]}"; do
-      /bin/launchctl unsetenv "${var}" >/dev/null 2>&1 || true
-      log_debug "launchctl unsetenv ${var}"
-    done
+    clear_launch_env || true
   fi
-
-  if [[ -n "${BRIDGE_PID}" ]]; then
-    log_debug "stopping bridge ${BRIDGE_PID}"
-    /bin/kill "${BRIDGE_PID}" >/dev/null 2>&1 || true
-  fi
+  stop_bridge
 
   return "${status}"
 }
@@ -120,6 +205,12 @@ join_by() {
     fi
   done
   print -r -- "${joined}"
+}
+
+is_valid_port() {
+  local value="$1"
+  [[ "${value}" =~ '^[0-9]+$' ]] || return 1
+  (( 10#${value} >= 1 && 10#${value} <= 65535 ))
 }
 
 bypass_chromium_item() {
@@ -426,7 +517,7 @@ add_proxy() {
   id="$(generate_proxy_id "${name}")"
   host="$(prompt_text "Add Proxy" "SOCKS5 host for ${name}." "")" || return 0
   port="$(prompt_text "Add Proxy" "SOCKS5 port for ${name}." "1080")" || return 0
-  if [[ ! "${port}" =~ '^[0-9]+$' ]]; then
+  if ! is_valid_port "${port}"; then
     fail "Invalid proxy port: ${port}"
   fi
   username="$(prompt_text "Add Proxy" "Optional SOCKS5 username for ${name}. Leave empty if not required." "")" || return 0
@@ -475,7 +566,7 @@ edit_proxy() {
   fi
   host="$(prompt_text "Edit Proxy" "SOCKS5 host for ${name}." "$(proxy_host "${id}")")" || return 0
   port="$(prompt_text "Edit Proxy" "SOCKS5 port for ${name}." "$(proxy_port "${id}")")" || return 0
-  if [[ ! "${port}" =~ '^[0-9]+$' ]]; then
+  if ! is_valid_port "${port}"; then
     fail "Invalid proxy port: ${port}"
   fi
   username="$(prompt_text "Edit Proxy" "Optional SOCKS5 username for ${name}. Leave empty if not required." "$(proxy_username "${id}")")" || return 0
@@ -659,6 +750,12 @@ source "${CONFIG_FILE}"
 ensure_proxy_config
 log_debug "config loaded from ${CONFIG_FILE}"
 log_debug "active proxy id: ${ACTIVE_PROXY}"
+
+# Clear only a previous handoff from this launcher, never an unrelated proxy.
+if ! clear_stale_handoff_env; then
+  fail "Cannot clear stale ChatGPT Proxy environment variables. Log out of macOS and try again."
+fi
+
 if [[ "${CHATGPT_PROXY_SKIP_UI:-0}" != "1" ]]; then
   select_active_proxy
   log_debug "active proxy after UI: ${ACTIVE_PROXY}"
@@ -666,6 +763,9 @@ fi
 
 PROXY_HOST="$(proxy_host "${ACTIVE_PROXY}")"
 PROXY_PORT="$(proxy_port "${ACTIVE_PROXY}")"
+if ! is_valid_port "${PROXY_PORT}"; then
+  fail "Invalid SOCKS5 proxy port: ${PROXY_PORT}. Use a value from 1 to 65535."
+fi
 PROXY_URL_HOST="$(proxy_url_host "${PROXY_HOST}")"
 PROXY_USERINFO="$(proxy_userinfo "${ACTIVE_PROXY}")"
 PROXY_ENV="socks5h://${PROXY_USERINFO}${PROXY_URL_HOST}:${PROXY_PORT}"
@@ -712,39 +812,20 @@ chatgpt_process_pids() {
   done
 }
 
-bridge_has_active_clients() {
-  local pid="$1"
-  /usr/sbin/lsof -nP -a -p "${pid}" -iTCP -sTCP:ESTABLISHED 2>/dev/null | /usr/bin/tail -n +2 | /usr/bin/grep -q .
-}
-
-cleanup_idle_legacy_bridges() {
-  local bridge_pid parent_pid parent_command
-  for bridge_pid in "${(@f)$("/usr/bin/pgrep" -f "socks-http-bridge.mjs" 2>/dev/null || true)}"; do
-    [[ -n "${bridge_pid}" ]] || continue
-    parent_pid="$(/bin/ps -p "${bridge_pid}" -o ppid= 2>/dev/null | /usr/bin/tr -d ' ' || true)"
-    [[ -n "${parent_pid}" ]] || continue
-    parent_command="$(/bin/ps -p "${parent_pid}" -o command= 2>/dev/null || true)"
-    [[ "${parent_command}" == *"chatgpt-proxy-launch.sh"* ]] || continue
-
-    if bridge_has_active_clients "${bridge_pid}"; then
-      log_debug "keeping active bridge ${bridge_pid}"
-      continue
-    fi
-
-    log_debug "stopping idle legacy bridge ${bridge_pid} and launcher ${parent_pid}"
-    /bin/kill "${bridge_pid}" >/dev/null 2>&1 || true
-    /bin/kill "${parent_pid}" >/dev/null 2>&1 || true
-  done
-}
-
 if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
-  cleanup_idle_legacy_bridges
   BRIDGE_HOST="${HTTP_BRIDGE_HOST:-127.0.0.1}"
   BRIDGE_PORT="${HTTP_BRIDGE_PORT:-28083}"
-  while /usr/bin/nc -z "${BRIDGE_HOST}" "${BRIDGE_PORT}" >/dev/null 2>&1; do
-    (( BRIDGE_PORT++ ))
-  done
-  BRIDGE_PROXY_ENV="http://${BRIDGE_HOST}:${BRIDGE_PORT}"
+  case "${BRIDGE_HOST}" in
+    127.0.0.1|localhost|::1) ;;
+    *) fail "Bridge host must be a loopback address: 127.0.0.1, localhost, or ::1." ;;
+  esac
+  if ! is_valid_port "${BRIDGE_PORT}"; then
+    fail "Invalid local HTTP bridge port: ${BRIDGE_PORT}. Use a value from 1 to 65535."
+  fi
+  if /usr/bin/nc -z "${BRIDGE_HOST}" "${BRIDGE_PORT}" >/dev/null 2>&1; then
+    fail "Local HTTP bridge port ${BRIDGE_HOST}:${BRIDGE_PORT} is already in use. Quit the existing ChatGPT Proxy session or choose another port."
+  fi
+  BRIDGE_PROXY_ENV="http://$(proxy_url_host "${BRIDGE_HOST}"):${BRIDGE_PORT}"
   log_debug "bridge proxy env: ${BRIDGE_PROXY_ENV}"
   BRIDGE_NODE="/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
   if [[ ! -x "${BRIDGE_NODE}" ]]; then
@@ -764,10 +845,14 @@ if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
   log_debug "bridge pid: ${BRIDGE_PID}"
 
   for _ in {1..20}; do
-    /usr/bin/nc -z "${BRIDGE_HOST}" "${BRIDGE_PORT}" >/dev/null 2>&1 && break
+    if /bin/kill -0 "${BRIDGE_PID}" >/dev/null 2>&1 && \
+       /usr/bin/nc -z "${BRIDGE_HOST}" "${BRIDGE_PORT}" >/dev/null 2>&1; then
+      break
+    fi
     sleep 0.1
   done
-  if ! /usr/bin/nc -z "${BRIDGE_HOST}" "${BRIDGE_PORT}" >/dev/null 2>&1; then
+  if ! /bin/kill -0 "${BRIDGE_PID}" >/dev/null 2>&1 || \
+     ! /usr/bin/nc -z "${BRIDGE_HOST}" "${BRIDGE_PORT}" >/dev/null 2>&1; then
     log_debug "bridge did not start on ${BRIDGE_HOST}:${BRIDGE_PORT}"
     fail "Local HTTP bridge did not start on ${BRIDGE_HOST}:${BRIDGE_PORT}."
   fi
@@ -800,11 +885,9 @@ if [[ -n "${HOST_RESOLVER_RULES}" ]]; then
   CHATGPT_ARGS+=("--host-resolver-rules=${HOST_RESOLVER_RULES}")
 fi
 
-for var in "${LAUNCH_ENV_VARS[@]}"; do
-  /bin/launchctl setenv "${var}" "${(P)var}" >/dev/null 2>&1 || true
-  log_debug "launchctl setenv ${var}=$(redact_proxy_url "${(P)var}")"
-done
-LAUNCH_ENV_ACTIVE=1
+if ! begin_launch_env_handoff; then
+  fail "Cannot prepare the temporary ChatGPT proxy environment. Cleanup was attempted; if launchctl proxy variables remain, log out of macOS before retrying."
+fi
 
 log_debug "launch args: $(redact_proxy_url "${CHATGPT_ARGS[*]}")"
 "${CHATGPT_EXECUTABLE}" "${CHATGPT_ARGS[@]}" >> "${DEBUG_OUTPUT}" 2>&1 &
@@ -812,6 +895,24 @@ CHATGPT_MAIN_PID=$!
 OPEN_STATUS=0
 log_debug "ChatGPT main pid: ${CHATGPT_MAIN_PID}"
 sleep 2
+
+# ChatGPT and its children inherit the launcher's environment. launchctl is only
+# a short handoff for components that spawn during initial app startup.
+if [[ "${LAUNCH_ENV_ACTIVE}" == "1" ]] && ! clear_launch_env; then
+  /bin/kill -TERM "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || true
+  fail "ChatGPT started, but the temporary launchctl proxy environment could not be cleared. Quit ChatGPT and log out of macOS before retrying."
+fi
+
+if [[ -n "${BRIDGE_PID}" ]] && ! /bin/kill -0 "${BRIDGE_PID}" >/dev/null 2>&1; then
+  /bin/kill -TERM "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || true
+  fail "The local HTTP bridge exited during ChatGPT startup. ChatGPT was stopped and no temporary proxy environment was left active."
+fi
+
+if ! /bin/kill -0 "${CHATGPT_MAIN_PID}" >/dev/null 2>&1; then
+  wait "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || true
+  fail "ChatGPT exited before startup completed. The local HTTP bridge and temporary proxy environment were cleaned up."
+fi
+
 log_debug "ChatGPT pids after launch: $(join_by " " "${(@f)$(chatgpt_process_pids)}")"
 for pid in "${(@f)$(chatgpt_process_pids)}"; do
   log_command "ChatGPT process ${pid}" /bin/ps -p "${pid}" -o pid=,comm=

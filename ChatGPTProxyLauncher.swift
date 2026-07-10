@@ -358,7 +358,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "proxyHostRequired": "Proxy host is required",
             "proxyHostRequiredInfo": "%@ needs a SOCKS host.",
             "proxyPortInvalid": "Proxy port is invalid",
-            "proxyPortInvalidInfo": "%@ needs a numeric SOCKS port.",
+            "proxyPortInvalidInfo": "%@ needs a SOCKS port from 1 to 65535.",
+            "bridgeHostInvalid": "Bridge host is invalid",
+            "bridgeHostInvalidInfo": "Use a loopback host: 127.0.0.1, localhost, or ::1.",
+            "bridgePortInvalid": "Bridge port is invalid",
+            "bridgePortInvalidInfo": "Use a bridge port from 1 to 65535.",
             "unableLaunch": "Unable to launch ChatGPT",
             "missingScript": "Cannot find executable script:\n%@",
             "alreadyRunningTitle": "ChatGPT is already running",
@@ -404,7 +408,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "proxyHostRequired": "代理主机不能为空",
             "proxyHostRequiredInfo": "%@ 需要 SOCKS 主机地址。",
             "proxyPortInvalid": "代理端口无效",
-            "proxyPortInvalidInfo": "%@ 需要数字端口。",
+            "proxyPortInvalidInfo": "%@ 需要 1 到 65535 之间的 SOCKS 端口。",
+            "bridgeHostInvalid": "Bridge 主机无效",
+            "bridgeHostInvalidInfo": "请使用回环主机：127.0.0.1、localhost 或 ::1。",
+            "bridgePortInvalid": "Bridge 端口无效",
+            "bridgePortInvalidInfo": "请输入 1 到 65535 之间的 Bridge 端口。",
             "unableLaunch": "无法启动 ChatGPT",
             "missingScript": "找不到可执行脚本：\n%@",
             "alreadyRunningTitle": "ChatGPT 已经在运行",
@@ -920,8 +928,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 showError(tr("proxyHostRequired"), String(format: tr("proxyHostRequiredInfo"), proxy.name))
                 return false
             }
-            if Int(proxy.port) == nil {
+            guard let port = Int(proxy.port), (1...65535).contains(port) else {
                 showError(tr("proxyPortInvalid"), String(format: tr("proxyPortInvalidInfo"), proxy.name))
+                return false
+            }
+        }
+        if config.proxies.contains(where: \.bridge) {
+            let bridgeHost = config.httpBridgeHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !["127.0.0.1", "localhost", "::1"].contains(bridgeHost) {
+                showError(tr("bridgeHostInvalid"), tr("bridgeHostInvalidInfo"))
+                return false
+            }
+            guard let bridgePort = Int(config.httpBridgePort), (1...65535).contains(bridgePort) else {
+                showError(tr("bridgePortInvalid"), tr("bridgePortInvalidInfo"))
                 return false
             }
         }

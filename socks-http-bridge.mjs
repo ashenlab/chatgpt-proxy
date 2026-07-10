@@ -3,15 +3,19 @@ import net from "node:net";
 import { URL } from "node:url";
 
 const listenHost = process.env.BRIDGE_LISTEN_HOST || "127.0.0.1";
-const listenPort = Number(process.env.BRIDGE_LISTEN_PORT || "18083");
+const listenPort = Number(process.env.BRIDGE_LISTEN_PORT || "28083");
 const upstream = new URL(process.env.UPSTREAM_SOCKS || "socks5://127.0.0.1:1080");
-const upstreamHost = upstream.hostname;
+const upstreamHost = upstream.hostname.replace(/^\[|\]$/g, "");
 const upstreamPort = Number(upstream.port || "1080");
 const upstreamUsername = decodeURIComponent(upstream.username || "");
 const upstreamPassword = decodeURIComponent(upstream.password || "");
 const upstreamNeedsAuth = upstreamUsername.length > 0 || upstreamPassword.length > 0;
 const parentPid = process.ppid;
 const debug = process.env.BRIDGE_DEBUG === "1";
+
+if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
+  throw new Error(`invalid bridge port: ${process.env.BRIDGE_LISTEN_PORT || "28083"}`);
+}
 
 function debugLog(message) {
   if (debug) console.error(`[bridge] ${message}`);
@@ -42,16 +46,25 @@ function parseConnectHead(buffer) {
 
 function parseAuthority(authority) {
   if (!authority) throw new Error("missing CONNECT authority");
+  let host;
+  let port;
   if (authority.startsWith("[")) {
     const close = authority.indexOf("]");
     if (close === -1) throw new Error("invalid IPv6 authority");
-    const host = authority.slice(1, close);
-    const port = Number(authority.slice(close + 2));
-    return { host, port };
+    if (authority[close + 1] !== ":") throw new Error("missing CONNECT port");
+    host = authority.slice(1, close);
+    port = Number(authority.slice(close + 2));
+  } else {
+    const split = authority.lastIndexOf(":");
+    if (split === -1) throw new Error("missing CONNECT port");
+    host = authority.slice(0, split);
+    port = Number(authority.slice(split + 1));
   }
-  const split = authority.lastIndexOf(":");
-  if (split === -1) throw new Error("missing CONNECT port");
-  return { host: authority.slice(0, split), port: Number(authority.slice(split + 1)) };
+  if (!host) throw new Error("missing CONNECT host");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("invalid CONNECT port");
+  }
+  return { host, port };
 }
 
 function socksConnect(targetHost, targetPort, initialPayload, client) {
@@ -194,6 +207,11 @@ const server = net.createServer((client) => {
       writeError(client, 400, "Bad Request");
     }
   });
+});
+
+server.on("error", (error) => {
+  console.error(`[bridge] listen failed: ${error.message}`);
+  process.exitCode = 1;
 });
 
 server.listen(listenPort, listenHost);
