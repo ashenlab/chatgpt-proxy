@@ -7,6 +7,18 @@ LEGACY_SUPPORT_DIR="${HOME}/Library/Application Support/Codex Proxy"
 CONFIG_FILE="${CHATGPT_PROXY_CONFIG_FILE:-${SUPPORT_DIR}/chatgpt-proxy.conf}"
 EXAMPLE_CONFIG_FILE="${CHATGPT_PROXY_EXAMPLE_CONFIG_FILE:-${SCRIPT_DIR}/chatgpt-proxy.conf.example}"
 DEBUG_LOG_FILE="${SUPPORT_DIR}/chatgpt-proxy-debug.log"
+BRIDGE_PID=""
+LAUNCH_ENV_ACTIVE=0
+LAUNCH_ENV_VARS=(
+  ALL_PROXY
+  HTTP_PROXY
+  HTTPS_PROXY
+  all_proxy
+  http_proxy
+  https_proxy
+  NO_PROXY
+  no_proxy
+)
 /bin/mkdir -p "${SUPPORT_DIR}"
 if [[ ! -f "${CONFIG_FILE}" && -f "${LEGACY_SUPPORT_DIR}/codex-proxy.conf" ]]; then
   /bin/cp "${LEGACY_SUPPORT_DIR}/codex-proxy.conf" "${CONFIG_FILE}"
@@ -30,6 +42,30 @@ log_command() {
 }
 
 log_debug "launcher started"
+
+cleanup_launcher() {
+  local status=$?
+  local var
+  trap - EXIT
+
+  if [[ "${LAUNCH_ENV_ACTIVE}" == "1" ]]; then
+    for var in "${LAUNCH_ENV_VARS[@]}"; do
+      /bin/launchctl unsetenv "${var}" >/dev/null 2>&1 || true
+      log_debug "launchctl unsetenv ${var}"
+    done
+  fi
+
+  if [[ -n "${BRIDGE_PID}" ]]; then
+    log_debug "stopping bridge ${BRIDGE_PID}"
+    /bin/kill "${BRIDGE_PID}" >/dev/null 2>&1 || true
+  fi
+
+  return "${status}"
+}
+
+trap cleanup_launcher EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 redact_proxy_url() {
   print -r -- "$1" | /usr/bin/sed -E 's#(socks5h?://)[^/@]+@#\1***@#; s#(https?://)[^/@]+@#\1***@#'
@@ -676,30 +712,33 @@ chatgpt_process_pids() {
   done
 }
 
-chatgpt_is_running() {
-  [[ -n "$(chatgpt_process_pids)" ]]
+bridge_has_active_clients() {
+  local pid="$1"
+  /usr/sbin/lsof -nP -a -p "${pid}" -iTCP -sTCP:ESTABLISHED 2>/dev/null | /usr/bin/tail -n +2 | /usr/bin/grep -q .
 }
 
-cleanup_stale_proxy_helpers_if_safe() {
-  local pid command
-  if chatgpt_is_running; then
-    log_debug "ChatGPT is still running; skip stale bridge cleanup"
-    return 0
-  fi
-  for pid in "${(@f)$("/usr/bin/pgrep" -f "chatgpt-proxy-launch.sh|socks-http-bridge.mjs" 2>/dev/null || true)}"; do
-    [[ -n "${pid}" ]] || continue
-    [[ "${pid}" != "$$" ]] || continue
-    command="$(/bin/ps -p "${pid}" -o command= 2>/dev/null || true)"
-    [[ -n "${command}" ]] || continue
-    if [[ "${command}" == *"chatgpt-proxy-launch.sh"* || "${command}" == *"socks-http-bridge.mjs"* ]]; then
-      log_debug "stopping stale proxy helper ${pid}: ${command}"
-      /bin/kill "${pid}" >/dev/null 2>&1 || true
+cleanup_idle_legacy_bridges() {
+  local bridge_pid parent_pid parent_command
+  for bridge_pid in "${(@f)$("/usr/bin/pgrep" -f "socks-http-bridge.mjs" 2>/dev/null || true)}"; do
+    [[ -n "${bridge_pid}" ]] || continue
+    parent_pid="$(/bin/ps -p "${bridge_pid}" -o ppid= 2>/dev/null | /usr/bin/tr -d ' ' || true)"
+    [[ -n "${parent_pid}" ]] || continue
+    parent_command="$(/bin/ps -p "${parent_pid}" -o command= 2>/dev/null || true)"
+    [[ "${parent_command}" == *"chatgpt-proxy-launch.sh"* ]] || continue
+
+    if bridge_has_active_clients "${bridge_pid}"; then
+      log_debug "keeping active bridge ${bridge_pid}"
+      continue
     fi
+
+    log_debug "stopping idle legacy bridge ${bridge_pid} and launcher ${parent_pid}"
+    /bin/kill "${bridge_pid}" >/dev/null 2>&1 || true
+    /bin/kill "${parent_pid}" >/dev/null 2>&1 || true
   done
 }
 
 if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
-  cleanup_stale_proxy_helpers_if_safe
+  cleanup_idle_legacy_bridges
   BRIDGE_HOST="${HTTP_BRIDGE_HOST:-127.0.0.1}"
   BRIDGE_PORT="${HTTP_BRIDGE_PORT:-18083}"
   while /usr/bin/nc -z "${BRIDGE_HOST}" "${BRIDGE_PORT}" >/dev/null 2>&1; do
@@ -718,7 +757,7 @@ if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
   BRIDGE_LISTEN_HOST="${BRIDGE_HOST}" \
   BRIDGE_LISTEN_PORT="${BRIDGE_PORT}" \
   UPSTREAM_SOCKS="${PROXY_CHROMIUM}" \
-  BRIDGE_WATCH_PARENT=0 \
+  BRIDGE_WATCH_PARENT=1 \
   BRIDGE_DEBUG="${CHATGPT_PROXY_DEBUG:-0}" \
     "${BRIDGE_CMD[@]}" "${SCRIPT_DIR}/socks-http-bridge.mjs" >> "${DEBUG_OUTPUT}" 2>&1 &
   BRIDGE_PID=$!
@@ -761,21 +800,11 @@ if [[ -n "${HOST_RESOLVER_RULES}" ]]; then
   CHATGPT_ARGS+=("--host-resolver-rules=${HOST_RESOLVER_RULES}")
 fi
 
-LAUNCH_ENV_VARS=(
-  ALL_PROXY
-  HTTP_PROXY
-  HTTPS_PROXY
-  all_proxy
-  http_proxy
-  https_proxy
-  NO_PROXY
-  no_proxy
-)
-
 for var in "${LAUNCH_ENV_VARS[@]}"; do
   /bin/launchctl setenv "${var}" "${(P)var}" >/dev/null 2>&1 || true
   log_debug "launchctl setenv ${var}=$(redact_proxy_url "${(P)var}")"
 done
+LAUNCH_ENV_ACTIVE=1
 
 log_debug "launch args: $(redact_proxy_url "${CHATGPT_ARGS[*]}")"
 "${CHATGPT_EXECUTABLE}" "${CHATGPT_ARGS[@]}" >> "${DEBUG_OUTPUT}" 2>&1 &
@@ -788,31 +817,10 @@ for pid in "${(@f)$(chatgpt_process_pids)}"; do
   log_command "ChatGPT process ${pid}" /bin/ps -p "${pid}" -o pid=,comm=
 done
 
-cleanup_launch_env() {
-  local var
-  for var in "${LAUNCH_ENV_VARS[@]}"; do
-    /bin/launchctl unsetenv "${var}" >/dev/null 2>&1 || true
-    log_debug "launchctl unsetenv ${var}"
-  done
-}
-
 if [[ "${OPEN_STATUS}" -eq 0 ]]; then
   log_debug "waiting for ChatGPT main process ${CHATGPT_MAIN_PID}"
   wait "${CHATGPT_MAIN_PID}" || OPEN_STATUS=$?
   log_debug "ChatGPT main process exited with status ${OPEN_STATUS}"
-  if chatgpt_is_running; then
-    log_debug "ChatGPT helper processes are still running; waiting for process group to end"
-    while chatgpt_is_running; do
-      sleep 5
-    done
-  fi
-fi
-
-cleanup_launch_env
-
-if [[ -n "${BRIDGE_PID:-}" ]]; then
-  log_debug "ChatGPT process group ended; stopping bridge ${BRIDGE_PID}"
-  kill "${BRIDGE_PID}" >/dev/null 2>&1 || true
 fi
 
 exit "${OPEN_STATUS}"
