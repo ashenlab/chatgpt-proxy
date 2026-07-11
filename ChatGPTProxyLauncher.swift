@@ -283,6 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let bridgePortField = NSTextField()
     private var editingProxyID: String?
     private let titleLabel = NSTextField(labelWithString: "")
+    private let versionLabel = NSTextField(labelWithString: "")
     private let subtitleLabel = NSTextField(labelWithString: "")
     private let languageMenu = NSPopUpButton()
     private let proxyTabItem = NSTabViewItem(identifier: "proxies")
@@ -427,6 +428,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func refreshLanguage() {
         window.title = tr("title")
         titleLabel.stringValue = tr("title")
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        versionLabel.stringValue = version.map { "v\($0)" } ?? ""
         subtitleLabel.stringValue = tr("subtitle")
         proxyTabItem.label = tr("proxies")
         bypassTabItem.label = tr("bypass")
@@ -464,6 +467,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         titleRow.alignment = .centerY
         titleRow.spacing = 12
         titleLabel.font = .systemFont(ofSize: 22, weight: .semibold)
+        versionLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        versionLabel.textColor = .secondaryLabelColor
         subtitleLabel.textColor = .secondaryLabelColor
         subtitleLabel.font = .systemFont(ofSize: 13)
         subtitleLabel.lineBreakMode = .byWordWrapping
@@ -473,6 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         languageMenu.target = self
         languageMenu.action = #selector(languageChanged)
         titleRow.addArrangedSubview(titleLabel)
+        titleRow.addArrangedSubview(versionLabel)
         titleRow.addArrangedSubview(NSView())
         titleRow.addArrangedSubview(languageMenu)
         root.addArrangedSubview(titleRow)
