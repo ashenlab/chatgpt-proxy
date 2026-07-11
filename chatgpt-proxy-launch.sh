@@ -812,6 +812,49 @@ chatgpt_process_pids() {
   done
 }
 
+chatgpt_main_pids() {
+  /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk \
+    '$2 == "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT" { print $1 }'
+}
+
+chatgpt_residual_pids() {
+  /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk \
+    'index($2, "/Applications/ChatGPT.app/Contents/") == 1 { print $1 }'
+}
+
+cleanup_orphaned_chatgpt_processes() {
+  local pids=() remaining=()
+  local pid attempt residual_output
+
+  if [[ -n "$(chatgpt_main_pids)" ]]; then
+    fail "ChatGPT is still running. Quit it completely, then launch ChatGPT Proxy again."
+  fi
+
+  residual_output="$(chatgpt_residual_pids)"
+  [[ -n "${residual_output}" ]] || return 0
+  pids=("${(@f)residual_output}")
+  log_debug "stopping orphaned ChatGPT processes: ${pids[*]}"
+  /bin/kill -TERM "${pids[@]}" >/dev/null 2>&1 || true
+
+  for attempt in {1..30}; do
+    remaining=()
+    for pid in "${pids[@]}"; do
+      /bin/kill -0 "${pid}" >/dev/null 2>&1 && remaining+=("${pid}")
+    done
+    (( ${#remaining[@]} == 0 )) && return 0
+    sleep 0.1
+  done
+
+  log_debug "forcing orphaned ChatGPT processes to stop: ${remaining[*]}"
+  /bin/kill -KILL "${remaining[@]}" >/dev/null 2>&1 || true
+  sleep 0.1
+  if [[ -n "$(chatgpt_residual_pids)" ]]; then
+    fail "Some orphaned ChatGPT helper processes could not be stopped. Log out of macOS and try again."
+  fi
+}
+
+cleanup_orphaned_chatgpt_processes
+
 if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
   BRIDGE_HOST="${HTTP_BRIDGE_HOST:-127.0.0.1}"
   BRIDGE_PORT="${HTTP_BRIDGE_PORT:-28083}"
