@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const bridgeScript = path.join(root, "socks-http-bridge.mjs");
+const bridgeSource = path.join(root, "NativeSocksHTTPBridge.c");
+const bridgeBinary = process.env.CHATGPT_PROXY_BRIDGE_BINARY || path.join(root, ".build", "chatgpt-socks-http-bridge-test");
+const usePackagedBridge = Boolean(process.env.CHATGPT_PROXY_BRIDGE_BINARY);
 
 function listen(server, port = 0) {
   return new Promise((resolve, reject) => {
@@ -67,13 +70,15 @@ async function waitForPort(port, child) {
 }
 
 function startBridge(bridgePort, socksPort) {
-  return spawn(process.execPath, [bridgeScript], {
+  return spawn(bridgeBinary, [], {
     env: {
       ...process.env,
       BRIDGE_LISTEN_HOST: "127.0.0.1",
       BRIDGE_LISTEN_PORT: String(bridgePort),
-      UPSTREAM_SOCKS: `socks5://127.0.0.1:${socksPort}`,
-      BRIDGE_WATCH_PARENT: "0",
+      UPSTREAM_SOCKS_HOST: "127.0.0.1",
+      UPSTREAM_SOCKS_PORT: String(socksPort),
+      UPSTREAM_SOCKS_USERNAME: "",
+      UPSTREAM_SOCKS_PASSWORD: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -86,6 +91,16 @@ function stopChild(child) {
 }
 
 async function main() {
+  if (!usePackagedBridge) {
+    await fs.promises.mkdir(path.dirname(bridgeBinary), { recursive: true });
+    await new Promise((resolve, reject) => {
+      const compiler = spawn("/usr/bin/clang", ["-O2", "-Wall", "-Wextra", "-Werror", "-pthread", bridgeSource, "-o", bridgeBinary], {
+        stdio: "inherit",
+      });
+      compiler.once("error", reject);
+      compiler.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`bridge compiler exited with ${code}`)));
+    });
+  }
   let requestedHost = "";
   let requestedPort = 0;
   const socksServer = net.createServer((socket) => {

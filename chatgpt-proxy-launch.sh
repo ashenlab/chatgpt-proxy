@@ -9,18 +9,6 @@ EXAMPLE_CONFIG_FILE="${CHATGPT_PROXY_EXAMPLE_CONFIG_FILE:-${SCRIPT_DIR}/chatgpt-
 DEBUG_LOG_FILE="${SUPPORT_DIR}/chatgpt-proxy-debug.log"
 DEBUG_FLAG_FILE="${SUPPORT_DIR}/diagnostics.enabled"
 BRIDGE_PID=""
-LAUNCH_ENV_ACTIVE=0
-LAUNCH_ENV_MARKER="CHATGPT_PROXY_HANDOFF_URL"
-LAUNCH_ENV_VARS=(
-  ALL_PROXY
-  HTTP_PROXY
-  HTTPS_PROXY
-  all_proxy
-  http_proxy
-  https_proxy
-  NO_PROXY
-  no_proxy
-)
 /bin/mkdir -p "${SUPPORT_DIR}"
 if [[ ! -f "${CONFIG_FILE}" && -f "${LEGACY_SUPPORT_DIR}/codex-proxy.conf" ]]; then
   /bin/cp "${LEGACY_SUPPORT_DIR}/codex-proxy.conf" "${CONFIG_FILE}"
@@ -47,79 +35,6 @@ log_command() {
 
 log_debug "launcher started"
 
-clear_launch_env() {
-  local var failed=0
-  for var in "${LAUNCH_ENV_VARS[@]}"; do
-    if /bin/launchctl unsetenv "${var}" >/dev/null 2>&1; then
-      log_debug "launchctl unsetenv ${var}"
-    else
-      log_debug "launchctl unsetenv ${var} failed"
-      failed=1
-    fi
-  done
-  if /bin/launchctl unsetenv "${LAUNCH_ENV_MARKER}" >/dev/null 2>&1; then
-    log_debug "launchctl unsetenv ${LAUNCH_ENV_MARKER}"
-  else
-    log_debug "launchctl unsetenv ${LAUNCH_ENV_MARKER} failed"
-    failed=1
-  fi
-
-  if [[ "${failed}" == "0" ]]; then
-    LAUNCH_ENV_ACTIVE=0
-    return 0
-  fi
-  return 1
-}
-
-clear_stale_handoff_env() {
-  local marker legacy_url current_proxy
-  marker="$(/bin/launchctl getenv "${LAUNCH_ENV_MARKER}" 2>/dev/null || true)"
-  legacy_url="http://$(proxy_url_host "${HTTP_BRIDGE_HOST:-127.0.0.1}"):${HTTP_BRIDGE_PORT:-28083}"
-  current_proxy="$(/bin/launchctl getenv HTTP_PROXY 2>/dev/null || true)"
-
-  if [[ -n "${marker}" || "${current_proxy}" == "${legacy_url}" ]]; then
-    log_debug "clearing stale ChatGPT Proxy launchctl handoff"
-    LAUNCH_ENV_ACTIVE=1
-    clear_launch_env
-  fi
-}
-
-launch_env_is_clean() {
-  local var value
-  for var in "${LAUNCH_ENV_VARS[@]}"; do
-    value="$(/bin/launchctl getenv "${var}" 2>/dev/null || true)"
-    if [[ -n "${value}" ]]; then
-      log_debug "launchctl ${var} already exists; skipping global handoff"
-      return 1
-    fi
-  done
-  return 0
-}
-
-begin_launch_env_handoff() {
-  local var
-  if ! launch_env_is_clean; then
-    return 0
-  fi
-
-  LAUNCH_ENV_ACTIVE=1
-  if ! /bin/launchctl setenv "${LAUNCH_ENV_MARKER}" "chatgpt-proxy:$$" >/dev/null 2>&1; then
-    log_debug "launchctl setenv ${LAUNCH_ENV_MARKER} failed"
-    clear_launch_env || true
-    return 1
-  fi
-
-  for var in "${LAUNCH_ENV_VARS[@]}"; do
-    if ! /bin/launchctl setenv "${var}" "${(P)var}" >/dev/null 2>&1; then
-      log_debug "launchctl setenv ${var} failed"
-      clear_launch_env || true
-      return 1
-    fi
-    log_debug "launchctl setenv ${var}=$(redact_proxy_url "${(P)var}")"
-  done
-  return 0
-}
-
 stop_bridge() {
   local pid="${BRIDGE_PID}"
   local attempt
@@ -142,10 +57,6 @@ stop_bridge() {
 cleanup_launcher() {
   local status=$?
   trap - EXIT
-
-  if [[ "${LAUNCH_ENV_ACTIVE}" == "1" ]]; then
-    clear_launch_env || true
-  fi
   stop_bridge
 
   return "${status}"
@@ -754,11 +665,6 @@ ensure_proxy_config
 log_debug "config loaded from ${CONFIG_FILE}"
 log_debug "active proxy id: ${ACTIVE_PROXY}"
 
-# Clear only a previous handoff from this launcher, never an unrelated proxy.
-if ! clear_stale_handoff_env; then
-  fail "Cannot clear stale ChatGPT Proxy environment variables. Log out of macOS and try again."
-fi
-
 if [[ "${CHATGPT_PROXY_SKIP_UI:-0}" != "1" ]]; then
   select_active_proxy
   log_debug "active proxy after UI: ${ACTIVE_PROXY}"
@@ -810,7 +716,7 @@ chatgpt_process_pids() {
     [[ -n "${pid}" ]] || continue
     command="$(/bin/ps -p "${pid}" -o command= 2>/dev/null || true)"
     [[ -n "${command}" ]] || continue
-    [[ "${command}" != *"socks-http-bridge.mjs"* ]] || continue
+    [[ "${command}" != *"chatgpt-socks-http-bridge"* ]] || continue
     print -r -- "${pid}"
   done
 }
@@ -823,11 +729,6 @@ chatgpt_main_pids() {
 chatgpt_residual_pids() {
   /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk \
     'index($2, "/Applications/ChatGPT.app/Contents/") == 1 { print $1 }'
-}
-
-chatgpt_app_server_pids() {
-  /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk \
-    '$2 == "/Applications/ChatGPT.app/Contents/Resources/codex" && index($0, " app-server") > 0 { print $1 }'
 }
 
 cleanup_orphaned_chatgpt_processes() {
@@ -897,20 +798,20 @@ if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
   fi
   BRIDGE_PROXY_ENV="http://$(proxy_url_host "${BRIDGE_HOST}"):${BRIDGE_PORT}"
   log_debug "bridge proxy env: ${BRIDGE_PROXY_ENV}"
-  BRIDGE_NODE="/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
-  if [[ ! -x "${BRIDGE_NODE}" ]]; then
-    BRIDGE_CMD=(/usr/bin/env node)
-  else
-    BRIDGE_CMD=("${BRIDGE_NODE}")
+  BRIDGE_EXECUTABLE="${SCRIPT_DIR}/chatgpt-socks-http-bridge"
+  if [[ ! -x "${BRIDGE_EXECUTABLE}" ]]; then
+    fail "Cannot find native HTTP bridge: ${BRIDGE_EXECUTABLE}"
   fi
-  log_debug "bridge command: ${BRIDGE_CMD[*]}"
+  log_debug "bridge command: ${BRIDGE_EXECUTABLE}"
 
   BRIDGE_LISTEN_HOST="${BRIDGE_HOST}" \
   BRIDGE_LISTEN_PORT="${BRIDGE_PORT}" \
-  UPSTREAM_SOCKS="${PROXY_CHROMIUM}" \
-  BRIDGE_WATCH_PARENT=1 \
+  UPSTREAM_SOCKS_HOST="${PROXY_HOST}" \
+  UPSTREAM_SOCKS_PORT="${PROXY_PORT}" \
+  UPSTREAM_SOCKS_USERNAME="$(proxy_username "${ACTIVE_PROXY}")" \
+  UPSTREAM_SOCKS_PASSWORD="$(proxy_password "${ACTIVE_PROXY}")" \
   BRIDGE_DEBUG="${DEBUG_ENABLED}" \
-    "${BRIDGE_CMD[@]}" "${SCRIPT_DIR}/socks-http-bridge.mjs" >> "${DEBUG_OUTPUT}" 2>&1 &
+    "${BRIDGE_EXECUTABLE}" >> "${DEBUG_OUTPUT}" 2>&1 &
   BRIDGE_PID=$!
   log_debug "bridge pid: ${BRIDGE_PID}"
 
@@ -943,7 +844,7 @@ if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
       --proxy "${BRIDGE_PROXY_ENV}" \
       "${BRIDGE_PREFLIGHT_URL}" >> "${DEBUG_OUTPUT}" 2>&1; then
     log_debug "bridge upstream connectivity check failed"
-    fail "The local HTTP bridge cannot reach SOCKS5 proxy ${PROXY_HOST}:${PROXY_PORT}. If this proxy is on your LAN, enable ChatGPT Proxy (or a legacy CodexProxyLauncher entry) in System Settings > Privacy & Security > Local Network, then try again."
+    fail "The local HTTP bridge started, but SOCKS5 CONNECT through ${PROXY_HOST}:${PROXY_PORT} failed. Check local-network permission for ChatGPT Proxy when this proxy is on your LAN, then verify the SOCKS5 service and its upstream route."
   fi
   log_debug "bridge upstream connectivity check passed"
 
@@ -974,44 +875,11 @@ if [[ -n "${HOST_RESOLVER_RULES}" ]]; then
   CHATGPT_ARGS+=("--host-resolver-rules=${HOST_RESOLVER_RULES}")
 fi
 
-if ! begin_launch_env_handoff; then
-  fail "Cannot prepare the temporary ChatGPT proxy environment. Cleanup was attempted; if launchctl proxy variables remain, log out of macOS before retrying."
-fi
-
 log_debug "launch args: $(redact_proxy_url "${CHATGPT_ARGS[*]}")"
 "${CHATGPT_EXECUTABLE}" "${CHATGPT_ARGS[@]}" >> "${DEBUG_OUTPUT}" 2>&1 &
 CHATGPT_MAIN_PID=$!
 OPEN_STATUS=0
 log_debug "ChatGPT main pid: ${CHATGPT_MAIN_PID}"
-
-# New ChatGPT builds can create app-server later than the main Chromium
-# processes. Keep the short launchd handoff available until app-server has
-# inherited it, then allow a brief grace period for its immediate children.
-APP_SERVER_READY=0
-for _ in {1..150}; do
-  if ! /bin/kill -0 "${CHATGPT_MAIN_PID}" >/dev/null 2>&1; then
-    break
-  fi
-  if [[ -n "$(chatgpt_app_server_pids)" ]]; then
-    APP_SERVER_READY=1
-    log_debug "ChatGPT app-server is ready"
-    sleep 2
-    break
-  fi
-  sleep 0.1
-done
-
-if [[ "${APP_SERVER_READY}" != "1" ]]; then
-  /bin/kill -TERM "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || true
-  fail "ChatGPT app-server did not start in time. ChatGPT was stopped, and the temporary proxy environment was cleaned up."
-fi
-
-# ChatGPT and its children inherit the launcher's environment. launchctl is only
-# a bounded handoff for components that spawn during initial app startup.
-if [[ "${LAUNCH_ENV_ACTIVE}" == "1" ]] && ! clear_launch_env; then
-  /bin/kill -TERM "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || true
-  fail "ChatGPT started, but the temporary launchctl proxy environment could not be cleared. Quit ChatGPT and log out of macOS before retrying."
-fi
 
 if [[ -n "${BRIDGE_PID}" ]] && ! /bin/kill -0 "${BRIDGE_PID}" >/dev/null 2>&1; then
   /bin/kill -TERM "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || true
