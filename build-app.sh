@@ -7,8 +7,8 @@ APP="${OUTPUT_DIR}/ChatGPT Proxy.app"
 CONTENTS="${APP}/Contents"
 RESOURCES="${CONTENTS}/Resources"
 MACOS="${CONTENTS}/MacOS"
-VERSION="2.1.0"
-BUILD="11"
+VERSION="2.1.1"
+BUILD="12"
 
 rm -rf "${APP}"
 mkdir -p "${MACOS}" "${RESOURCES}"
@@ -51,6 +51,8 @@ cat > "${CONTENTS}/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>${BUILD}</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>ChatGPT Proxy launches ChatGPT, which uses the microphone for voice conversations.</string>
+  <key>NSCameraUsageDescription</key><string>ChatGPT Proxy launches ChatGPT, which uses the camera for video conversations.</string>
   <key>NSLocalNetworkUsageDescription</key><string>ChatGPT Proxy connects to your local SOCKS5 proxy to start ChatGPT with per-app proxy settings.</string>
 </dict></plist>
 PLIST
