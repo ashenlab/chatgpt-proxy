@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
@@ -11,11 +12,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #define HEADER_LIMIT 32768
 #define BUFFER_SIZE 65536
+#define DEFAULT_HANDSHAKE_TIMEOUT_SECONDS 15
+#define DEFAULT_MAX_CONNECTIONS 128
 
 static const char *upstream_host;
 static const char *upstream_port;
@@ -23,6 +27,10 @@ static const char *upstream_username;
 static const char *upstream_password;
 static bool debug_enabled;
 static volatile sig_atomic_t should_stop;
+static unsigned int handshake_timeout_seconds = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS;
+static unsigned int max_connections = DEFAULT_MAX_CONNECTIONS;
+static unsigned int active_connections;
+static pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void debug_log(const char *format, ...) {
   if (!debug_enabled) return;
@@ -39,6 +47,51 @@ static void close_fd(int *fd) {
     close(*fd);
     *fd = -1;
   }
+}
+
+static unsigned int positive_env_value(const char *name, unsigned int fallback,
+                                       unsigned int maximum) {
+  const char *value = getenv(name);
+  if (value == NULL || value[0] == '\0') return fallback;
+  char *end = NULL;
+  errno = 0;
+  unsigned long parsed = strtoul(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || parsed == 0 || parsed > maximum) {
+    return fallback;
+  }
+  return (unsigned int)parsed;
+}
+
+static void set_socket_timeout(int fd, unsigned int seconds) {
+  struct timeval timeout = {
+    .tv_sec = (time_t)seconds,
+    .tv_usec = 0,
+  };
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+static void clear_socket_timeout(int fd) {
+  struct timeval timeout = {0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+static bool reserve_connection(void) {
+  bool reserved = false;
+  pthread_mutex_lock(&connection_mutex);
+  if (active_connections < max_connections) {
+    active_connections++;
+    reserved = true;
+  }
+  pthread_mutex_unlock(&connection_mutex);
+  return reserved;
+}
+
+static void release_connection(void) {
+  pthread_mutex_lock(&connection_mutex);
+  if (active_connections > 0) active_connections--;
+  pthread_mutex_unlock(&connection_mutex);
 }
 
 static bool send_all(int fd, const void *data, size_t length) {
@@ -95,7 +148,36 @@ static int connect_tcp(const char *host, const char *port) {
   for (struct addrinfo *result = results; result != NULL; result = result->ai_next) {
     fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (fd < 0) continue;
-    if (connect(fd, result->ai_addr, result->ai_addrlen) == 0) break;
+    int original_flags = fcntl(fd, F_GETFL, 0);
+    if (original_flags < 0 || fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) < 0) {
+      close_fd(&fd);
+      continue;
+    }
+
+    int connection_status = connect(fd, result->ai_addr, result->ai_addrlen);
+    if (connection_status < 0 && errno == EINPROGRESS) {
+      struct pollfd pending = {.fd = fd, .events = POLLOUT};
+      int ready = poll(&pending, 1, (int)handshake_timeout_seconds * 1000);
+      if (ready > 0 && (pending.revents & (POLLOUT | POLLERR | POLLHUP))) {
+        socklen_t error_length = sizeof(connection_status);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &connection_status, &error_length) != 0) {
+          connection_status = errno;
+        }
+      } else {
+        connection_status = ready == 0 ? ETIMEDOUT : errno;
+      }
+    } else if (connection_status < 0) {
+      connection_status = errno;
+    }
+
+    if (fcntl(fd, F_SETFL, original_flags) < 0) {
+      connection_status = errno;
+    }
+    if (connection_status == 0) {
+      set_socket_timeout(fd, handshake_timeout_seconds);
+      break;
+    }
+    errno = connection_status;
     debug_log("upstream socket error: %s", strerror(errno));
     close_fd(&fd);
   }
@@ -276,6 +358,7 @@ static void relay(int client_fd, int upstream_fd) {
 static void *handle_client(void *argument) {
   int client_fd = *(int *)argument;
   free(argument);
+  set_socket_timeout(client_fd, handshake_timeout_seconds);
   uint8_t request[HEADER_LIMIT];
   size_t used = 0;
   char *target_host = NULL;
@@ -314,12 +397,15 @@ static void *handle_client(void *argument) {
     close_fd(&upstream_fd);
     goto finish;
   }
+  clear_socket_timeout(client_fd);
+  clear_socket_timeout(upstream_fd);
   relay(client_fd, upstream_fd);
   close_fd(&upstream_fd);
 
 finish:
   free(target_host);
   close_fd(&client_fd);
+  release_connection();
   return NULL;
 }
 
@@ -356,7 +442,12 @@ int main(void) {
   upstream_port = getenv("UPSTREAM_SOCKS_PORT");
   upstream_username = getenv("UPSTREAM_SOCKS_USERNAME");
   upstream_password = getenv("UPSTREAM_SOCKS_PASSWORD");
-  debug_enabled = getenv("BRIDGE_DEBUG") != NULL && strcmp(getenv("BRIDGE_DEBUG"), "1") == 0;
+  const char *debug_value = getenv("BRIDGE_DEBUG");
+  debug_enabled = debug_value != NULL && strcmp(debug_value, "1") == 0;
+  handshake_timeout_seconds = positive_env_value(
+      "BRIDGE_HANDSHAKE_TIMEOUT_SECONDS", DEFAULT_HANDSHAKE_TIMEOUT_SECONDS, 300);
+  max_connections = positive_env_value(
+      "BRIDGE_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS, 4096);
 
   if (listen_host == NULL || listen_port == NULL || upstream_host == NULL || upstream_port == NULL) {
     fputs("[bridge] missing required bridge environment\n", stderr);
@@ -384,8 +475,15 @@ int main(void) {
     if (ready <= 0) continue;
     int client_fd = accept(listener_fd, NULL, NULL);
     if (client_fd < 0) continue;
+    if (!reserve_connection()) {
+      set_socket_timeout(client_fd, 1);
+      write_http_error(client_fd, 503, "Service Unavailable");
+      close(client_fd);
+      continue;
+    }
     int *client_argument = malloc(sizeof(*client_argument));
     if (client_argument == NULL) {
+      release_connection();
       close(client_fd);
       continue;
     }
@@ -395,6 +493,7 @@ int main(void) {
       pthread_detach(thread);
     } else {
       free(client_argument);
+      release_connection();
       close(client_fd);
     }
   }

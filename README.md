@@ -22,6 +22,7 @@ ChatGPT Proxy 只在启动 ChatGPT 时注入代理环境变量与 Chromium 代�
 
 ## 要求
 
+- Apple Silicon Mac（当前发布包为 `arm64`）。
 - macOS 12 或更高版本，与当前 ChatGPT Desktop 的最低系统要求一致。
 - 已安装新版 ChatGPT Desktop。默认路径为 `/Applications/ChatGPT.app`；其他位置可通过 `CHATGPT_APP_PATH` 配置。
 - 可用的 SOCKS5 服务端；认证为可选项。
@@ -43,9 +44,13 @@ ChatGPT Proxy 只在启动 ChatGPT 时注入代理环境变量与 Chromium 代�
 
 正常情况下，ChatGPT 的 Chromium 网络请求可直接使用 SOCKS5。部分内部 HTTP 客户端对 SOCKS5 环境变量的支持不完整时，可能出现登录正常但对话、内部请求或插件市场超时/加载不完整的情况。
 
-为对应代理启用 `Use local HTTP bridge` 后，启动器只在回环地址上临时启动一个原生 HTTP CONNECT bridge（新配置默认是 `127.0.0.1:28083`），再将流量转发至该 SOCKS5 服务器。bridge 随启动器一同打包，不依赖 ChatGPT.app 内部 Node 或机器上另行安装的运行时；因此其本地网络访问稳定归属 `ChatGPT Proxy`。ChatGPT 仅继承本次启动进程的代理环境和 Chromium 参数，启动器不会调用 `launchctl`、不会写入全局 GUI 代理环境，也不会改动系统 HTTP 代理。启动 ChatGPT 后，启动器会隐藏窗口并在后台保持运行，以便 macOS 正确维持 bridge 的本地网络权限身份；点击程序坞中的 ChatGPT Proxy 可重新打开配置窗口并切换代理，启动器会等待旧 bridge 释放监听端口后再重新启动。bridge 和启动器会随本次 ChatGPT 主进程结束而退出；通过程序坞、左上角应用菜单或 `⌘Q` 手动退出启动器时，如果其管理的 ChatGPT 仍在运行，会先提示确认，确认后同时结束 ChatGPT 并清理 bridge，避免留下失效的代理环境。配置端口被其他程序持续占用时会明确报错，不会抢占端口或静默递增并产生多个监听。配置窗口中的“当前状态”按钮可查看启动器与 ChatGPT 进程、本地监听、本次代理变量和直连规则，并只读核对系统代理与全局 `launchctl` 代理变量。预期的当前 bridge 监听会明确标记为“正常”；只有未由有效启动脚本管理的 bridge、额外启动脚本、失效会话记录或监听所有者不匹配等情况才会列入“异常信息”。从 2.1.5 build 22 起，启动器会维护临时受管会话所有权记录，正常退出时自动删除。无法确认来源的系统值不会被标记为 ChatGPT Proxy 异常。
+为对应代理启用 `Use local HTTP bridge` 后，启动器只在回环地址上临时启动一个原生 HTTP CONNECT bridge（新配置默认是 `127.0.0.1:28083`），再将流量转发至该 SOCKS5 服务器。bridge 随启动器一同打包，不依赖 ChatGPT.app 内部 Node 或机器上另行安装的运行时；因此其本地网络访问稳定归属 `ChatGPT Proxy`。ChatGPT 仅继承本次启动进程的代理环境和 Chromium 参数，启动器不会调用 `launchctl`、不会写入全局 GUI 代理环境，也不会改动系统 HTTP 代理。启动 ChatGPT 后，启动器会隐藏窗口并在后台保持运行，以便 macOS 正确维持 bridge 的本地网络权限身份；点击程序坞中的 ChatGPT Proxy 可重新打开配置窗口并切换代理，启动器会等待旧 bridge 释放监听端口后再重新启动。bridge 和启动器会随本次 ChatGPT 主进程结束而退出；通过程序坞、左上角应用菜单或 `⌘Q` 手动退出启动器时，如果其管理的 ChatGPT 仍在运行，会先提示确认，确认后同时结束 ChatGPT 并清理 bridge，避免留下失效的代理环境。配置端口被其他程序持续占用时会明确报错，不会抢占端口或静默递增并产生多个监听。配置窗口中的“当前状态”按钮可查看启动器与 ChatGPT 进程、本地监听、本次代理变量和直连规则，并只读核对系统代理与全局 `launchctl` 代理变量。预期的当前 bridge 监听会明确标记为“正常”；只有未由有效启动脚本管理的 bridge、额外启动脚本、仍对应存活相关进程的旧会话记录或监听所有者不匹配等情况才会列入“异常信息”。从 2.1.5 build 22 起，启动器会维护临时受管会话所有权记录，正常退出时自动删除。无法确认来源的系统值不会被标记为 ChatGPT Proxy 异常。
+
+bridge 对连接建立和 SOCKS5 握手设置 15 秒超时，并将同时处理的连接限制为 128 个。已经建立的正常长连接不使用短时空闲超时，不会影响 Voice、视频或 Codex 长任务。
 
 只有当 SOCKS5 服务器通过当前 Mac 的 Wi-Fi 或以太网直接位于同一局域网时，macOS 15 及以上版本才可能要求在 `系统设置 > 隐私与安全性 > 本地网络` 中允许 ChatGPT Proxy。公网 IPv4、全球单播 IPv6、`127.0.0.1`/`localhost`，以及经 VPN 路由而不是本地链路到达的代理通常不需要这项权限。本地 HTTP bridge 自身只监听回环地址；触发权限的是 bridge 向局域网 SOCKS5 服务器发起的连接。
+
+“当前状态”会区分 ChatGPT 未启动、由当前 ChatGPT Proxy 会话启动，以及已运行但并非由当前会话启动三种情况。没有启动受管会话时，不需要 bridge 监听，当前选择的代理配置会明确标记为“尚未应用”，不会被误报为异常。异常退出后可能留下仅用于诊断的上次会话状态文件；如果其中记录的脚本、bridge 和 ChatGPT 都已结束，状态页会将它显示为无影响的“会话记录”，而不是异常。只有相关进程或监听仍然存在时才会列入“异常信息”。
 
 启动器会在打开 ChatGPT 前通过 bridge 做一次真实连接测试；失败时不会继续打开一个无法显示账户、额度、对话或插件市场的窗口。直接局域网 SOCKS5 的失败通常应检查 ChatGPT Proxy 的本地网络权限、SOCKS5 服务和上游链路。临时签名版本升级后，macOS 偶尔可能再次要求确认此权限；旧版迁移用户还可能看到 `CodexProxyLauncher` 名称。
 
@@ -60,6 +65,8 @@ ChatGPT Proxy 只在启动 ChatGPT 时注入代理环境变量与 Chromium 代�
 首次从旧版启动器升级时，会自动复制旧的本地配置到新目录。该迁移仅用于保留你的配置；启动器不会再启动旧版 Codex Desktop。
 
 真实配置可能含有代理地址、内网规则和认证信息。请勿提交或分享它；仓库只提供公开的 [chatgpt-proxy.conf.example](chatgpt-proxy.conf.example) 模板。
+
+启动器会将该目录权限设置为 `700`，并将配置、会话记录和诊断日志设置为 `600`；升级后首次启动会自动收紧旧版本创建文件的权限。界面保存的 `$`、反引号、引号和反斜杠会安全转义，避免配置被 Shell 错误展开。
 
 ChatGPT 默认从 `/Applications/ChatGPT.app` 启动。如果安装在其他位置，请退出当前 ChatGPT Proxy 会话，然后在 `chatgpt-proxy.conf` 中设置 `.app` 包的完整路径：
 
@@ -89,7 +96,7 @@ CHATGPT_APP_PATH="/Users/your-name/Applications/ChatGPT.app"
 ./build-app.sh
 ```
 
-产物位于 `.build/ChatGPT Proxy.app`。构建后的本地 App 使用临时签名；首次启动或更新后，直接连接局域网 SOCKS5 时 macOS 可能再次请求本地网络授权。
+产物位于 `.build/ChatGPT Proxy.app`。Swift 模块缓存写入系统临时目录，不会在项目的 `.build` 中持续累积。构建脚本还会检查启动器和 bridge 的最低系统版本均为 macOS 12。构建后的本地 App 使用临时签名；首次启动或更新后，直接连接局域网 SOCKS5 时 macOS 可能再次请求本地网络授权。
 
 bridge 的离线集成测试只使用本机回环端口和模拟 SOCKS5 服务，不访问外网。测试本身需要开发机提供 Node；应用运行不需要 Node：
 
@@ -112,6 +119,7 @@ ChatGPT Proxy is a native macOS launcher that starts **ChatGPT Desktop** with pe
 
 ### Requirements
 
+- An Apple Silicon Mac (the current release is `arm64`).
 - macOS 12 or later, matching the current ChatGPT Desktop minimum requirement.
 - The current ChatGPT Desktop app. The default path is `/Applications/ChatGPT.app`; use `CHATGPT_APP_PATH` for another location.
 - A reachable SOCKS5 server; authentication is optional.
@@ -137,7 +145,11 @@ Most Chromium traffic can use SOCKS5 directly. Some internal HTTP clients may no
 
 For that proxy profile, enable **Use local HTTP bridge**. The launcher temporarily opens a native HTTP CONNECT bridge on a loopback address (`127.0.0.1:28083` by default for new configurations) and forwards it to the selected SOCKS5 server. The bridge is bundled with ChatGPT Proxy, rather than using ChatGPT.app's private Node runtime, so its local-network access is consistently attributed to ChatGPT Proxy. ChatGPT receives proxy environment variables and Chromium arguments only through the process started for that launch. The launcher never calls `launchctl`, writes global GUI proxy variables, or changes the system HTTP proxy. After starting ChatGPT, the launcher hides its window and remains alive in the background so macOS can retain the bridge's Local Network identity correctly. Click ChatGPT Proxy in the Dock to reopen its configuration window and switch proxies; the launcher waits for the previous bridge listener to release its port before relaunching. The bridge and launcher exit when that ChatGPT main process ends. When manually quitting the launcher from the Dock, the application menu, or `⌘Q` while its managed ChatGPT instance is still running, the launcher asks for confirmation before quitting ChatGPT and cleaning up the bridge, avoiding a stale proxy environment. If another program continues to hold the configured port, startup fails explicitly rather than taking over the port or silently opening additional listeners. The **Current Status** button reports the managed launcher and ChatGPT processes, the local listener, session-scoped proxy variables and bypasses, plus read-only checks for system proxies and global `launchctl` proxy variables. The expected managed bridge listener is explicitly labeled **Normal**; only bridges without a valid managing launch script, extra launch scripts, stale session records, or listener ownership mismatches appear under **Abnormalities**. Starting with 2.1.5 build 22, a temporary managed-session ownership record is removed after clean shutdown. System values with uncertain ownership are never labeled as ChatGPT Proxy abnormalities.
 
+Connection setup and SOCKS5 negotiation have a 15-second timeout and the bridge accepts at most 128 concurrent tunnels. Established long-lived tunnels do not use a short idle timeout, so Voice, video, and long Codex tasks are unaffected.
+
 Local Network permission is only relevant when the SOCKS5 server is directly reachable on the same Wi-Fi or Ethernet LAN. Public IPv4 addresses, globally routable IPv6 addresses, `127.0.0.1`/`localhost`, and proxies reached through a VPN rather than the local link normally do not require it. The HTTP bridge itself listens only on loopback; the permission applies to its outbound connection to a LAN SOCKS5 server.
+
+**Current Status** distinguishes ChatGPT not running, running under the current managed session, and running independently of the current ChatGPT Proxy session. When no managed session has been launched, no bridge listener is required and the selected proxy profile is explicitly labeled as not applied instead of being reported as abnormal. An unexpected exit may leave a previous-session state file used only for diagnostics. If its recorded launch script, bridge, and ChatGPT processes have all ended, the status page presents it as a harmless **Session record**, not an abnormality. It is listed under **Abnormalities** only when a related process or listener is still active.
 
 On macOS 15 or later, allow ChatGPT Proxy under **System Settings > Privacy & Security > Local Network** when that LAN case applies. Before opening ChatGPT, the launcher performs a real request through the bridge. If that check fails, it stops before opening a window that cannot load account details, chats, or plugins. For a direct LAN SOCKS5 server, check ChatGPT Proxy's Local Network permission, the SOCKS5 service, and its upstream path. Ad hoc signed builds may require this permission again after an update; users migrating from older builds may also see a legacy `CodexProxyLauncher` entry.
 
@@ -149,7 +161,7 @@ The app and bridge use only macOS-provided toolchains:
 ./build-app.sh
 ```
 
-The output is `.build/ChatGPT Proxy.app`. Local builds use ad hoc signing, so macOS may request Local Network access again after a rebuild when the SOCKS5 server is directly reachable on the LAN.
+The output is `.build/ChatGPT Proxy.app`. Swift module caches are stored in the system temporary directory instead of accumulating under the project `.build` directory. The build also verifies that both the launcher and bridge target macOS 12. Local builds use ad hoc signing, so macOS may request Local Network access again after a rebuild when the SOCKS5 server is directly reachable on the LAN.
 
 ### Privacy and Configuration
 
@@ -160,6 +172,8 @@ Your private configuration is stored at:
 ```
 
 It may contain proxy endpoints, bypass rules, and credentials. Do not publish it. This repository contains only the safe [configuration template](chatgpt-proxy.conf.example).
+
+The launcher sets the directory mode to `700` and the configuration, session record, and diagnostic log modes to `600`. The first launch after upgrading also tightens permissions on files created by older versions. Dollar signs, backticks, quotes, and backslashes saved through the UI are escaped so the shell cannot expand them as configuration code.
 
 ChatGPT launches from `/Applications/ChatGPT.app` by default. If it is installed elsewhere, quit the current ChatGPT Proxy session and set the full `.app` bundle path in `chatgpt-proxy.conf`:
 

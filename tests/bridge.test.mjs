@@ -21,6 +21,7 @@ function listen(server, port = 0) {
 }
 
 function close(server) {
+  server.closeAllConnections?.();
   return new Promise((resolve) => server.close(resolve));
 }
 
@@ -69,7 +70,7 @@ async function waitForPort(port, child) {
   throw new Error(`bridge did not listen on ${port}`);
 }
 
-function startBridge(bridgePort, socksPort) {
+function startBridge(bridgePort, socksPort, environment = {}) {
   return spawn(bridgeBinary, [], {
     env: {
       ...process.env,
@@ -79,9 +80,40 @@ function startBridge(bridgePort, socksPort) {
       UPSTREAM_SOCKS_PORT: String(socksPort),
       UPSTREAM_SOCKS_USERNAME: "",
       UPSTREAM_SOCKS_PASSWORD: "",
+      ...environment,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+}
+
+function waitForSocketClose(socket, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error("timed out waiting for socket close")), timeoutMs);
+
+    function finish(error) {
+      clearTimeout(timer);
+      socket.off("close", onClose);
+      socket.off("end", onClose);
+      socket.off("error", onClose);
+      if (error) reject(error);
+      else resolve();
+    }
+
+    function onClose() {
+      finish();
+    }
+
+    socket.once("close", onClose);
+    socket.once("end", onClose);
+    socket.once("error", onClose);
+  });
+}
+
+async function reservePort() {
+  const reservation = net.createServer();
+  const port = await listen(reservation);
+  await close(reservation);
+  return port;
 }
 
 function stopChild(child) {
@@ -134,9 +166,7 @@ async function main() {
   });
 
   const socksPort = await listen(socksServer);
-  const reservation = net.createServer();
-  const bridgePort = await listen(reservation);
-  await close(reservation);
+  const bridgePort = await reservePort();
   const bridge = startBridge(bridgePort, socksPort);
 
   try {
@@ -171,8 +201,68 @@ async function main() {
     await waitForPort(bridgePort, restartedBridge);
   } finally {
     await stopChild(restartedBridge);
-    await close(socksServer);
   }
+
+  const headerTimeoutPort = await reservePort();
+  const headerTimeoutBridge = startBridge(headerTimeoutPort, socksPort, {
+    BRIDGE_HANDSHAKE_TIMEOUT_SECONDS: "1",
+  });
+  try {
+    await waitForPort(headerTimeoutPort, headerTimeoutBridge);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const stalledClient = net.connect({ host: "127.0.0.1", port: headerTimeoutPort });
+    await new Promise((resolve) => stalledClient.once("connect", resolve));
+    await waitForSocketClose(stalledClient, 2500);
+    stalledClient.destroy();
+  } finally {
+    await stopChild(headerTimeoutBridge);
+  }
+
+  const limitedPort = await reservePort();
+  const limitedBridge = startBridge(limitedPort, socksPort, {
+    BRIDGE_HANDSHAKE_TIMEOUT_SECONDS: "5",
+    BRIDGE_MAX_CONNECTIONS: "1",
+  });
+  try {
+    await waitForPort(limitedPort, limitedBridge);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const firstClient = net.connect({ host: "127.0.0.1", port: limitedPort });
+    await new Promise((resolve) => firstClient.once("connect", resolve));
+    const rejectedClient = net.connect({ host: "127.0.0.1", port: limitedPort });
+    await new Promise((resolve) => rejectedClient.once("connect", resolve));
+    const rejected = await readUntil(rejectedClient, (data) => data.includes("\r\n\r\n"));
+    assert.match(rejected.toString("latin1"), /^HTTP\/1\.1 503 /);
+    firstClient.destroy();
+    rejectedClient.destroy();
+  } finally {
+    await stopChild(limitedBridge);
+  }
+
+  const stalledSockets = new Set();
+  const stalledSocksServer = net.createServer((socket) => {
+    stalledSockets.add(socket);
+    socket.once("close", () => stalledSockets.delete(socket));
+  });
+  const stalledSocksPort = await listen(stalledSocksServer);
+  const socksTimeoutPort = await reservePort();
+  const socksTimeoutBridge = startBridge(socksTimeoutPort, stalledSocksPort, {
+    BRIDGE_HANDSHAKE_TIMEOUT_SECONDS: "1",
+  });
+  try {
+    await waitForPort(socksTimeoutPort, socksTimeoutBridge);
+    const client = net.connect({ host: "127.0.0.1", port: socksTimeoutPort });
+    await new Promise((resolve) => client.once("connect", resolve));
+    client.write("CONNECT example.com:443 HTTP/1.1\r\n\r\n");
+    const rejected = await readUntil(client, (data) => data.includes("\r\n\r\n"), 2500);
+    assert.match(rejected.toString("latin1"), /^HTTP\/1\.1 502 /);
+    client.destroy();
+  } finally {
+    await stopChild(socksTimeoutBridge);
+    for (const socket of stalledSockets) socket.destroy();
+    await close(stalledSocksServer);
+  }
+
+  await close(socksServer);
 
   const blocker = net.createServer();
   const blockedPort = await listen(blocker);

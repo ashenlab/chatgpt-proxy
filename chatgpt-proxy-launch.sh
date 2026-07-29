@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -eu
+umask 077
 
 SCRIPT_DIR="${0:A:h}"
 SUPPORT_DIR="${HOME}/Library/Application Support/ChatGPT Proxy"
@@ -12,6 +13,11 @@ SESSION_STATE_FILE="${SUPPORT_DIR}/managed-session.state"
 SESSION_STARTED_AT="$(/bin/date +%s)"
 BRIDGE_PID=""
 /bin/mkdir -p "${SUPPORT_DIR}"
+/bin/chmod 700 "${SUPPORT_DIR}" >/dev/null 2>&1 || true
+for sensitive_file in "${CONFIG_FILE}" "${DEBUG_LOG_FILE}" "${SESSION_STATE_FILE}"; do
+  [[ -f "${sensitive_file}" ]] || continue
+  /bin/chmod 600 "${sensitive_file}" >/dev/null 2>&1 || true
+done
 if [[ ! -f "${CONFIG_FILE}" && -f "${LEGACY_SUPPORT_DIR}/codex-proxy.conf" ]]; then
   /bin/cp "${LEGACY_SUPPORT_DIR}/codex-proxy.conf" "${CONFIG_FILE}"
 fi
@@ -121,6 +127,8 @@ config_quote() {
   local value="$1"
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
   print -r -- "\"${value}\""
 }
 

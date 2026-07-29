@@ -57,13 +57,18 @@ final class ConfigStore {
         scriptURL = resourcesURL.appendingPathComponent("chatgpt-proxy-launch.sh")
         sessionStateURL = supportURL.appendingPathComponent("managed-session.state")
         migrateLegacyConfigIfNeeded()
+        secureStoredFiles()
     }
 
     private func migrateLegacyConfigIfNeeded() {
         let fm = FileManager.default
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         if !fm.fileExists(atPath: supportURL.path) {
-            try? fm.createDirectory(at: supportURL, withIntermediateDirectories: true)
+            try? fm.createDirectory(
+                at: supportURL,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
         }
         guard !fm.fileExists(atPath: configURL.path) else { return }
 
@@ -84,6 +89,16 @@ final class ConfigStore {
 
         if fm.fileExists(atPath: exampleConfigURL.path) {
             try? fm.copyItem(at: exampleConfigURL, to: configURL)
+        }
+    }
+
+    private func secureStoredFiles() {
+        let fm = FileManager.default
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: supportURL.path)
+        for url in [configURL, sessionStateURL, supportURL.appendingPathComponent("chatgpt-proxy-debug.log")] {
+            if fm.fileExists(atPath: url.path) {
+                try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            }
         }
     }
 
@@ -163,6 +178,7 @@ final class ConfigStore {
         lines.append("# This starts with local/LAN defaults, but every item is editable in the launcher.")
         lines.append("BYPASS_ITEMS=(\(config.bypassItems.map(quote).joined(separator: " ")))")
         try lines.joined(separator: "\n").appending("\n").write(to: configURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
     }
 
     func defaultConfig() -> LauncherConfig {
@@ -214,6 +230,8 @@ final class ConfigStore {
         let escaped = value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "$", with: "\\$")
+            .replacingOccurrences(of: "`", with: "\\`")
         return "\"\(escaped)\""
     }
 
@@ -1023,12 +1041,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func currentStatusReport() -> String {
         let chinese = language == .chinese
         let launcherPID = ProcessInfo.processInfo.processIdentifier
-        let scriptPID = launchProcess?.isRunning == true ? String(launchProcess!.processIdentifier) : (chinese ? "未运行" : "Not running")
+        let managedSessionRunning = launchProcess?.isRunning == true && managedSessionSnapshot != nil
+        let scriptPID = managedSessionRunning ? String(launchProcess!.processIdentifier) : (chinese ? "未运行" : "Not running")
         let chatGPTPIDs = runningChatGPTApps().map { String($0.processIdentifier) }
-        let chatGPTStatus = chatGPTPIDs.isEmpty
-            ? (chinese ? "未运行" : "Not running")
-            : (chinese ? "运行中（PID \(chatGPTPIDs.joined(separator: ", "))）" : "Running (PID \(chatGPTPIDs.joined(separator: ", ")))")
-        let managedStatus = launchProcess?.isRunning == true
+        let chatGPTStatus: String
+        if chatGPTPIDs.isEmpty {
+            chatGPTStatus = chinese ? "未启动" : "Not running"
+        } else if managedSessionRunning {
+            chatGPTStatus = chinese
+                ? "由当前 ChatGPT Proxy 启动，运行中（PID \(chatGPTPIDs.joined(separator: ", "))）"
+                : "Running under the current ChatGPT Proxy session (PID \(chatGPTPIDs.joined(separator: ", ")))"
+        } else {
+            chatGPTStatus = chinese
+                ? "运行中，但不是由当前 ChatGPT Proxy 会话启动（PID \(chatGPTPIDs.joined(separator: ", "))）"
+                : "Running, but not launched by the current ChatGPT Proxy session (PID \(chatGPTPIDs.joined(separator: ", ")))"
+        }
+        let managedStatus = managedSessionRunning
             ? (chinese ? "运行中" : "Running")
             : (chinese ? "未运行" : "Not running")
 
@@ -1059,7 +1087,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         } ?? (chinese ? "无" : "None")
         let chromiumProxy = snapshot.map { "socks5://\(urlHost($0.proxyHost)):\($0.proxyPort)" } ?? (chinese ? "无" : "None")
         let bypass = snapshot?.bypassItems.joined(separator: ", ") ?? (chinese ? "无" : "None")
-        let listener = bridgeListenerStatus(snapshot: snapshot, chinese: chinese)
+        let listener = bridgeListenerStatus(snapshot: snapshot, managedSessionRunning: managedSessionRunning, chinese: chinese)
+        let sessionRecord = sessionRecordStatus(managedSessionRunning: managedSessionRunning, chinese: chinese)
         let abnormalities = abnormalStatus(chinese: chinese)
         let systemProxy = systemProxyStatus(chinese: chinese)
         let launchctlProxy = launchctlProxyStatus(chinese: chinese)
@@ -1075,7 +1104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             ChatGPT：\(chatGPTStatus)
             ChatGPT App 路径：\(snapshot?.chatGPTAppPath ?? config.chatGPTAppPath)
 
-            【本次会话的代理配置】
+            \(managedSessionRunning ? "【本次受管会话的代理配置】" : "【当前选择的代理配置（尚未应用）】")
             配置名称：\(proxyName)
             上游 SOCKS5：\(socksEndpoint)
             SOCKS5 认证：\(authentication)
@@ -1086,6 +1115,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
             【本地监听状态】
             \(listener)
+
+            【会话记录】
+            \(sessionRecord)
 
             【异常信息】
             \(abnormalities)
@@ -1118,7 +1150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         ChatGPT: \(chatGPTStatus)
         ChatGPT App path: \(snapshot?.chatGPTAppPath ?? config.chatGPTAppPath)
 
-        [Proxy settings for this session]
+        \(managedSessionRunning ? "[Proxy settings for this managed session]" : "[Currently selected proxy settings (not applied)]")
         Profile: \(proxyName)
         Upstream SOCKS5: \(socksEndpoint)
         SOCKS5 authentication: \(authentication)
@@ -1129,6 +1161,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         [Local listener status]
         \(listener)
+
+        [Session record]
+        \(sessionRecord)
 
         [Abnormalities]
         \(abnormalities)
@@ -1156,7 +1191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return host.contains(":") ? "[\(host)]" : host
     }
 
-    private func bridgeListenerStatus(snapshot: ManagedSessionSnapshot?, chinese: Bool) -> String {
+    private func bridgeListenerStatus(snapshot: ManagedSessionSnapshot?, managedSessionRunning: Bool, chinese: Bool) -> String {
         let port = snapshot?.bridgePort ?? config.httpBridgePort
         let host = snapshot?.bridgeHost ?? config.httpBridgeHost
         guard Int(port) != nil else {
@@ -1171,6 +1206,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             $0.command.hasPrefix(bridgePath) && $0.ppid == currentScriptPID
         }
 
+        if !managedSessionRunning, output.isEmpty {
+            return chinese
+                ? "正常：当前未启动受管 ChatGPT 会话，不需要 HTTP bridge 监听。"
+                : "Normal: no managed ChatGPT session is running, so no HTTP bridge listener is required."
+        }
+        if !managedSessionRunning {
+            return chinese
+                ? "异常：当前没有受管 ChatGPT 会话，但 \(host):\(port) 存在监听：\n\(output)"
+                : "Abnormal: no managed ChatGPT session is running, but \(host):\(port) has a listener:\n\(output)"
+        }
         if bridgeEnabled, let managedBridge, !output.isEmpty {
             return chinese
                 ? "正常：当前受管 HTTP bridge（PID \(managedBridge.pid)）正在监听 \(host):\(port)。"
@@ -1194,6 +1239,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return chinese
             ? "异常：本次会话未启用 HTTP bridge，但 \(host):\(port) 存在监听：\n\(output)"
             : "Abnormal: HTTP bridge is disabled for this session, but \(host):\(port) has a listener:\n\(output)"
+    }
+
+    private func sessionRecordStatus(managedSessionRunning: Bool, chinese: Bool) -> String {
+        let state = managedSessionState()
+        guard let recordedPIDText = state["script_pid"],
+              let recordedPID = Int32(recordedPIDText) else {
+            return chinese ? "没有受管会话记录。" : "No managed-session record."
+        }
+
+        let scriptPath = store.scriptURL.path
+        let bridgePath = store.resourcesURL.appendingPathComponent("chatgpt-socks-http-bridge").path
+        let currentScriptPID = launchProcess?.isRunning == true ? launchProcess?.processIdentifier : nil
+        let processes = proxyOwnedProcesses()
+        let matchingProcess = recordedPID == currentScriptPID || processes.contains {
+            $0.pid == recordedPID && isLaunchScriptCommand($0.command, scriptPath: scriptPath)
+        }
+        if managedSessionRunning && matchingProcess {
+            return chinese
+                ? "当前受管会话记录正常（启动脚本 PID \(recordedPID)）。"
+                : "The current managed-session record is normal (launch script PID \(recordedPID))."
+        }
+
+        let recordedBridgePID = state["bridge_pid"].flatMap(Int32.init)
+        let recordedChatGPTPID = state["chatgpt_pid"].flatMap(Int32.init)
+        let bridgeStillRunning = recordedBridgePID.map { bridgePID in
+            processes.contains { $0.pid == bridgePID && $0.command.hasPrefix(bridgePath) }
+        } ?? false
+        let runningChatGPTPIDs = Set(runningChatGPTApps().map(\.processIdentifier))
+        let chatGPTStillRunning = recordedChatGPTPID.map(runningChatGPTPIDs.contains) ?? false
+        if matchingProcess || bridgeStillRunning || chatGPTStillRunning {
+            return chinese
+                ? "上次会话记录仍对应正在运行的相关进程，详情请查看“异常信息”。"
+                : "The previous-session record still refers to a related running process. See Abnormalities for details."
+        }
+
+        let bridgePID = recordedBridgePID.map(String.init) ?? "-"
+        let chatGPTPID = recordedChatGPTPID.map(String.init) ?? "-"
+        let endpoint = [state["bridge_host"], state["bridge_port"]].compactMap { $0 }.joined(separator: ":")
+        return chinese
+            ? "上次会话留有状态记录（脚本 PID \(recordedPID)，bridge PID \(bridgePID)，ChatGPT PID \(chatGPTPID)，监听 \(endpoint.isEmpty ? "-" : endpoint)），但相关受管进程已经结束；该记录不影响当前系统，也不属于异常。"
+            : "A previous-session state record remains (script PID \(recordedPID), bridge PID \(bridgePID), ChatGPT PID \(chatGPTPID), listener \(endpoint.isEmpty ? "-" : endpoint)), but its managed processes have ended. The record does not affect the current system and is not an abnormality."
     }
 
     private func abnormalStatus(chinese: Bool) -> String {
@@ -1228,13 +1314,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let matchingProcess = recordedPID == currentScriptPID || processes.contains {
                 $0.pid == recordedPID && isLaunchScriptCommand($0.command, scriptPath: scriptPath)
             }
-            if !matchingProcess {
-                let bridgePID = state["bridge_pid"].flatMap(Int32.init).map(String.init) ?? "-"
-                let chatGPTPID = state["chatgpt_pid"].flatMap(Int32.init).map(String.init) ?? "-"
-                let endpoint = [state["bridge_host"], state["bridge_port"]].compactMap { $0 }.joined(separator: ":")
+            let runningChatGPTPIDs = Set(runningChatGPTApps().map(\.processIdentifier))
+            if !matchingProcess,
+               let recordedChatGPTPID = state["chatgpt_pid"].flatMap(Int32.init),
+               runningChatGPTPIDs.contains(recordedChatGPTPID) {
                 findings.append(chinese
-                    ? "发现未清理的受管会话记录：脚本 PID \(recordedPID)，bridge PID \(bridgePID)，ChatGPT PID \(chatGPTPID)，监听 \(endpoint.isEmpty ? "-" : endpoint)。记录文件：\(store.sessionStateURL.path)"
-                    : "Stale managed-session record: script PID \(recordedPID), bridge PID \(bridgePID), ChatGPT PID \(chatGPTPID), listener \(endpoint.isEmpty ? "-" : endpoint). State file: \(store.sessionStateURL.path)")
+                    ? "发现之前由 ChatGPT Proxy 启动的 ChatGPT 仍在运行（PID \(recordedChatGPTPID)），但对应启动脚本 PID \(recordedPID) 已结束。"
+                    : "ChatGPT from a previous managed session is still running (PID \(recordedChatGPTPID)), but its launch script PID \(recordedPID) has ended.")
             }
         }
 

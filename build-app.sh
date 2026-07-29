@@ -7,18 +7,21 @@ APP="${OUTPUT_DIR}/ChatGPT Proxy.app"
 CONTENTS="${APP}/Contents"
 RESOURCES="${CONTENTS}/Resources"
 MACOS="${CONTENTS}/MacOS"
-VERSION="2.1.5"
-BUILD="26"
+VERSION="2.1.6"
+BUILD="29"
+DEPLOYMENT_TARGET="12.0"
+MODULE_CACHE="${CHATGPT_PROXY_MODULE_CACHE_PATH:-${TMPDIR:-/tmp}/chatgpt-proxy-module-cache}"
 
 rm -rf "${APP}"
-mkdir -p "${MACOS}" "${RESOURCES}"
+mkdir -p "${MACOS}" "${RESOURCES}" "${MODULE_CACHE}"
 
 /usr/bin/clang -O2 -Wall -Wextra -Werror -pthread \
+  -target "arm64-apple-macosx${DEPLOYMENT_TARGET}" \
   "${ROOT}/NativeSocksHTTPBridge.c" \
   -o "${RESOURCES}/chatgpt-socks-http-bridge"
 
-/usr/bin/swiftc -O -target arm64-apple-macosx12.0 \
-  -module-cache-path "${OUTPUT_DIR}/SwiftModuleCache" \
+/usr/bin/swiftc -O -target "arm64-apple-macosx${DEPLOYMENT_TARGET}" \
+  -module-cache-path "${MODULE_CACHE}" \
   -framework AppKit \
   "${ROOT}/ChatGPTProxyLauncher.swift" \
   -o "${MACOS}/ChatGPTProxyLauncher"
@@ -36,6 +39,7 @@ for spec in 16 32 128 256 512; do
   /usr/bin/sips -z "${double}" "${double}" "${ROOT}/CodexProxyIcon.png" --out "${ICONSET}/icon_${spec}x${spec}@2x.png" >/dev/null
 done
 /usr/bin/iconutil -c icns "${ICONSET}" -o "${RESOURCES}/AppIcon.icns"
+rm -rf "${ICONSET}"
 
 cat > "${CONTENTS}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -60,4 +64,13 @@ cat > "${CONTENTS}/Info.plist" <<PLIST
 PLIST
 
 /usr/bin/codesign --force --deep --sign - "${APP}"
+
+for executable in "${MACOS}/ChatGPTProxyLauncher" "${RESOURCES}/chatgpt-socks-http-bridge"; do
+  minimum_version="$(/usr/bin/vtool -show-build "${executable}" | /usr/bin/awk '/minos/{print $2; exit}')"
+  if [[ "${minimum_version}" != "${DEPLOYMENT_TARGET}" ]]; then
+    print -u2 -- "Unexpected minimum macOS version for ${executable}: ${minimum_version:-unknown}"
+    exit 1
+  fi
+done
+
 echo "Built: ${APP}"
