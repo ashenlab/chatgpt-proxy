@@ -164,6 +164,13 @@ async function main() {
     assert.equal(bridge.exitCode, null, "a malformed request must not stop the bridge");
   } finally {
     await stopChild(bridge);
+  }
+
+  const restartedBridge = startBridge(bridgePort, socksPort);
+  try {
+    await waitForPort(bridgePort, restartedBridge);
+  } finally {
+    await stopChild(restartedBridge);
     await close(socksServer);
   }
 

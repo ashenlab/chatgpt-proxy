@@ -8,6 +8,8 @@ CONFIG_FILE="${CHATGPT_PROXY_CONFIG_FILE:-${SUPPORT_DIR}/chatgpt-proxy.conf}"
 EXAMPLE_CONFIG_FILE="${CHATGPT_PROXY_EXAMPLE_CONFIG_FILE:-${SCRIPT_DIR}/chatgpt-proxy.conf.example}"
 DEBUG_LOG_FILE="${SUPPORT_DIR}/chatgpt-proxy-debug.log"
 DEBUG_FLAG_FILE="${SUPPORT_DIR}/diagnostics.enabled"
+SESSION_STATE_FILE="${SUPPORT_DIR}/managed-session.state"
+SESSION_STARTED_AT="$(/bin/date +%s)"
 BRIDGE_PID=""
 /bin/mkdir -p "${SUPPORT_DIR}"
 if [[ ! -f "${CONFIG_FILE}" && -f "${LEGACY_SUPPORT_DIR}/codex-proxy.conf" ]]; then
@@ -35,6 +37,32 @@ log_command() {
 
 log_debug "launcher started"
 
+write_session_state() {
+  local temporary="${SESSION_STATE_FILE}.$$"
+  (
+    umask 077
+    print -r -- "version=1"
+    print -r -- "started_at=${SESSION_STARTED_AT}"
+    print -r -- "launcher_pid=${PPID}"
+    print -r -- "script_pid=$$"
+    print -r -- "bridge_pid=${BRIDGE_PID:-}"
+    print -r -- "chatgpt_pid=${CHATGPT_MAIN_PID:-}"
+    print -r -- "chatgpt_app_path=${CHATGPT_APP_PATH:-}"
+    print -r -- "bridge_host=${BRIDGE_HOST:-}"
+    print -r -- "bridge_port=${BRIDGE_PORT:-}"
+  ) > "${temporary}"
+  /bin/mv -f "${temporary}" "${SESSION_STATE_FILE}"
+}
+
+remove_session_state() {
+  local recorded_script_pid=""
+  [[ -f "${SESSION_STATE_FILE}" ]] || return 0
+  recorded_script_pid="$(/usr/bin/sed -n 's/^script_pid=//p' "${SESSION_STATE_FILE}" | /usr/bin/head -n 1)"
+  if [[ "${recorded_script_pid}" == "$$" ]]; then
+    /bin/rm -f "${SESSION_STATE_FILE}"
+  fi
+}
+
 stop_bridge() {
   local pid="${BRIDGE_PID}"
   local attempt
@@ -58,6 +86,7 @@ cleanup_launcher() {
   local status=$?
   trap - EXIT
   stop_bridge
+  remove_session_state
 
   return "${status}"
 }
@@ -125,6 +154,21 @@ is_valid_port() {
   local value="$1"
   [[ "${value}" =~ '^[0-9]+$' ]] || return 1
   (( 10#${value} >= 1 && 10#${value} <= 65535 ))
+}
+
+wait_for_bridge_port_release() {
+  local host="$1"
+  local port="$2"
+  local attempt
+
+  for attempt in {1..50}; do
+    if ! /usr/bin/nc -z "${host}" "${port}" >/dev/null 2>&1; then
+      log_debug "previous bridge listener released ${host}:${port}"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 bypass_chromium_item() {
@@ -289,6 +333,8 @@ generate_proxy_id() {
 }
 
 ensure_proxy_config() {
+  CHATGPT_APP_PATH="${CHATGPT_APP_PATH:-/Applications/ChatGPT.app}"
+
   if ! typeset -p PROXY_IDS >/dev/null 2>&1; then
     PROXY_IDS=(local remote)
     PROXY_LOCAL_NAME="Local SOCKS"
@@ -662,7 +708,11 @@ fi
 
 source "${CONFIG_FILE}"
 ensure_proxy_config
+CHATGPT_APP_PATH="${CHATGPT_APP_PATH%/}"
+CHATGPT_CONTENTS_PATH="${CHATGPT_APP_PATH}/Contents"
+CHATGPT_EXECUTABLE="${CHATGPT_CONTENTS_PATH}/MacOS/ChatGPT"
 log_debug "config loaded from ${CONFIG_FILE}"
+log_debug "ChatGPT app path: ${CHATGPT_APP_PATH}"
 log_debug "active proxy id: ${ACTIVE_PROXY}"
 
 if [[ "${CHATGPT_PROXY_SKIP_UI:-0}" != "1" ]]; then
@@ -711,27 +761,26 @@ fi
 log_debug "TCP check passed for ${PROXY_HOST}:${PROXY_PORT}"
 
 chatgpt_process_pids() {
-  local pid command
-  for pid in "${(@f)$("/usr/bin/pgrep" -f /Applications/ChatGPT.app/Contents 2>/dev/null || true)}"; do
-    [[ -n "${pid}" ]] || continue
-    command="$(/bin/ps -p "${pid}" -o command= 2>/dev/null || true)"
-    [[ -n "${command}" ]] || continue
-    [[ "${command}" != *"chatgpt-socks-http-bridge"* ]] || continue
+  local pid executable
+  /bin/ps -axo pid=,comm= 2>/dev/null | while read -r pid executable; do
+    [[ "${executable}" == "${CHATGPT_CONTENTS_PATH}/"* ]] || continue
     print -r -- "${pid}"
   done
 }
 
 chatgpt_main_pids() {
-  /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk \
-    '$2 == "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT" { print $1 }'
+  local pid executable
+  /bin/ps -axo pid=,comm= 2>/dev/null | while read -r pid executable; do
+    [[ "${executable}" == "${CHATGPT_EXECUTABLE}" ]] || continue
+    print -r -- "${pid}"
+  done
 }
 
 chatgpt_residual_pids() {
-  /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk \
-    'index($2, "/Applications/ChatGPT.app/Contents/") == 1 { print $1 }'
+  chatgpt_process_pids
 }
 
-cleanup_orphaned_chatgpt_processes() {
+cleanup_unmanaged_chatgpt_processes() {
   local pids=() remaining=()
   local pid attempt residual_output main_output
 
@@ -761,7 +810,7 @@ cleanup_orphaned_chatgpt_processes() {
   residual_output="$(chatgpt_residual_pids)"
   [[ -n "${residual_output}" ]] || return 0
   pids=("${(@f)residual_output}")
-  log_debug "stopping orphaned ChatGPT processes: ${pids[*]}"
+  log_debug "stopping leftover ChatGPT processes not managed by the current session: ${pids[*]}"
   /bin/kill -TERM "${pids[@]}" >/dev/null 2>&1 || true
 
   for attempt in {1..30}; do
@@ -773,15 +822,15 @@ cleanup_orphaned_chatgpt_processes() {
     sleep 0.1
   done
 
-  log_debug "forcing orphaned ChatGPT processes to stop: ${remaining[*]}"
+  log_debug "forcing leftover ChatGPT processes to stop: ${remaining[*]}"
   /bin/kill -KILL "${remaining[@]}" >/dev/null 2>&1 || true
   sleep 0.1
   if [[ -n "$(chatgpt_residual_pids)" ]]; then
-    fail "Some orphaned ChatGPT helper processes could not be stopped. Log out of macOS and try again."
+    fail "Some leftover ChatGPT helper processes could not be stopped. Log out of macOS and try again."
   fi
 }
 
-cleanup_orphaned_chatgpt_processes
+cleanup_unmanaged_chatgpt_processes
 
 if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
   BRIDGE_HOST="${HTTP_BRIDGE_HOST:-127.0.0.1}"
@@ -792,6 +841,11 @@ if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
   esac
   if ! is_valid_port "${BRIDGE_PORT}"; then
     fail "Invalid local HTTP bridge port: ${BRIDGE_PORT}. Use a value from 1 to 65535."
+  fi
+  if [[ "${CHATGPT_PROXY_WAIT_FOR_BRIDGE_RELEASE:-0}" == "1" ]] && \
+     /usr/bin/nc -z "${BRIDGE_HOST}" "${BRIDGE_PORT}" >/dev/null 2>&1; then
+    log_debug "waiting for previous bridge listener to release ${BRIDGE_HOST}:${BRIDGE_PORT}"
+    wait_for_bridge_port_release "${BRIDGE_HOST}" "${BRIDGE_PORT}" || true
   fi
   if /usr/bin/nc -z "${BRIDGE_HOST}" "${BRIDGE_PORT}" >/dev/null 2>&1; then
     fail "Local HTTP bridge port ${BRIDGE_HOST}:${BRIDGE_PORT} is already in use. Quit the existing ChatGPT Proxy session or choose another port."
@@ -814,6 +868,7 @@ if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
     "${BRIDGE_EXECUTABLE}" >> "${DEBUG_OUTPUT}" 2>&1 &
   BRIDGE_PID=$!
   log_debug "bridge pid: ${BRIDGE_PID}"
+  write_session_state
 
   for _ in {1..20}; do
     if /bin/kill -0 "${BRIDGE_PID}" >/dev/null 2>&1 && \
@@ -862,10 +917,9 @@ export https_proxy="${PROXY_ENV}"
 export NO_PROXY="${NO_PROXY_LIST}"
 export no_proxy="${NO_PROXY_LIST}"
 
-if [[ ! -x /Applications/ChatGPT.app/Contents/MacOS/ChatGPT ]]; then
-  fail "Cannot find executable: /Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+if [[ ! -x "${CHATGPT_EXECUTABLE}" ]]; then
+  fail "Cannot find ChatGPT executable: ${CHATGPT_EXECUTABLE}. Set CHATGPT_APP_PATH in chatgpt-proxy.conf to the ChatGPT.app location."
 fi
-CHATGPT_EXECUTABLE="/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
 
 CHATGPT_ARGS=(
   "--proxy-server=${CHROMIUM_PROXY}"
@@ -880,6 +934,7 @@ log_debug "launch args: $(redact_proxy_url "${CHATGPT_ARGS[*]}")"
 CHATGPT_MAIN_PID=$!
 OPEN_STATUS=0
 log_debug "ChatGPT main pid: ${CHATGPT_MAIN_PID}"
+write_session_state
 
 if [[ -n "${BRIDGE_PID}" ]] && ! /bin/kill -0 "${BRIDGE_PID}" >/dev/null 2>&1; then
   /bin/kill -TERM "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || true

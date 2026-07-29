@@ -12,10 +12,23 @@ struct ProxyConfig {
 
 struct LauncherConfig {
     var activeProxy: String = "lan"
+    var chatGPTAppPath: String = "/Applications/ChatGPT.app"
     var proxies: [ProxyConfig] = []
     var httpBridgeHost: String = "127.0.0.1"
     var httpBridgePort: String = "28083"
     var bypassItems: [String] = []
+}
+
+struct ManagedSessionSnapshot {
+    let chatGPTAppPath: String
+    let proxyName: String
+    let proxyHost: String
+    let proxyPort: String
+    let authenticationEnabled: Bool
+    let bridgeEnabled: Bool
+    let bridgeHost: String
+    let bridgePort: String
+    let bypassItems: [String]
 }
 
 enum AppLanguage: String {
@@ -31,6 +44,7 @@ final class ConfigStore {
     let configURL: URL
     let exampleConfigURL: URL
     let scriptURL: URL
+    let sessionStateURL: URL
 
     init(bundleURL: URL) {
         self.bundleURL = bundleURL
@@ -41,6 +55,7 @@ final class ConfigStore {
         configURL = supportURL.appendingPathComponent("chatgpt-proxy.conf")
         exampleConfigURL = resourcesURL.appendingPathComponent("chatgpt-proxy.conf.example")
         scriptURL = resourcesURL.appendingPathComponent("chatgpt-proxy-launch.sh")
+        sessionStateURL = supportURL.appendingPathComponent("managed-session.state")
         migrateLegacyConfigIfNeeded()
     }
 
@@ -111,6 +126,7 @@ final class ConfigStore {
 
         return LauncherConfig(
             activeProxy: proxies.contains(where: { $0.id == active }) ? active : proxies[0].id,
+            chatGPTAppPath: parseScalar(values["CHATGPT_APP_PATH"] ?? "\"/Applications/ChatGPT.app\""),
             proxies: proxies,
             httpBridgeHost: parseScalar(values["HTTP_BRIDGE_HOST"] ?? "\"127.0.0.1\""),
             httpBridgePort: parseScalar(values["HTTP_BRIDGE_PORT"] ?? "\"28083\""),
@@ -123,6 +139,9 @@ final class ConfigStore {
         var lines: [String] = []
         lines.append("# Active proxy id. Edit through ChatGPT Proxy, or update this file manually.")
         lines.append("ACTIVE_PROXY=\(quote(config.activeProxy))")
+        lines.append("")
+        lines.append("# ChatGPT application bundle. Paths containing spaces are supported.")
+        lines.append("CHATGPT_APP_PATH=\(quote(config.chatGPTAppPath))")
         lines.append("")
         lines.append("# Configured SOCKS5 proxies.")
         lines.append("PROXY_IDS=(\(proxyIDs))")
@@ -304,11 +323,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let resetBypassButton = NSButton()
     private let cancelButton = NSButton()
     private let saveButton = NSButton()
+    private let inspectStatusButton = NSButton()
     private let launchButton = NSButton()
     private let statusLabel = NSTextField(labelWithString: "")
     private var usernameRow: NSGridRow?
     private var passwordRow: NSGridRow?
     private var launchProcess: Process?
+    private var managedSessionSnapshot: ManagedSessionSnapshot?
     private var suppressTerminationForRelaunch = false
     private var terminationRequested = false
     private var automaticTerminationDisabled = false
@@ -457,7 +478,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "quitProxyTitle": "Quit ChatGPT Proxy?",
             "quitProxyInfo": "ChatGPT is currently running through ChatGPT Proxy. Quitting will also close ChatGPT and stop this proxy session.",
             "quitBoth": "Quit Both",
-            "quitApplication": "Quit ChatGPT Proxy"
+            "quitApplication": "Quit ChatGPT Proxy",
+            "inspectStatus": "Current Status",
+            "statusTitle": "ChatGPT Proxy Status",
+            "close": "Close",
+            "copy": "Copy"
         ]
         let zh: [String: String] = [
             "title": "ChatGPT Proxy",
@@ -512,7 +537,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "quitProxyTitle": "退出 ChatGPT Proxy？",
             "quitProxyInfo": "ChatGPT 当前正通过 ChatGPT Proxy 运行。继续退出将同时关闭 ChatGPT，并结束本次代理会话。",
             "quitBoth": "同时退出",
-            "quitApplication": "退出 ChatGPT Proxy"
+            "quitApplication": "退出 ChatGPT Proxy",
+            "inspectStatus": "当前状态",
+            "statusTitle": "ChatGPT Proxy 当前状态",
+            "close": "关闭",
+            "copy": "复制"
         ]
         return (language == .english ? en : zh)[key] ?? key
     }
@@ -545,6 +574,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         resetBypassButton.title = tr("resetDefaults")
         cancelButton.title = tr("cancel")
         saveButton.title = tr("save")
+        inspectStatusButton.title = tr("inspectStatus")
         launchButton.title = tr("launch")
         updateCurrentLabel()
     }
@@ -618,12 +648,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         cancelButton.action = #selector(cancelClicked)
         saveButton.target = self
         saveButton.action = #selector(saveClicked)
+        inspectStatusButton.target = self
+        inspectStatusButton.action = #selector(inspectStatusClicked)
         launchButton.target = self
         launchButton.action = #selector(launchClicked)
         launchButton.bezelStyle = .rounded
         launchButton.keyEquivalent = "\r"
         footer.addArrangedSubview(cancelButton)
         footer.addArrangedSubview(saveButton)
+        footer.addArrangedSubview(inspectStatusButton)
         footer.addArrangedSubview(launchButton)
         root.addArrangedSubview(footer)
         refreshLanguage()
@@ -958,6 +991,338 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
+    @objc private func inspectStatusClicked() {
+        let report = currentStatusReport()
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 660, height: 430))
+        textView.string = report
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.isHorizontallyResizable = false
+        textView.textContainer?.widthTracksTextView = true
+
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 660, height: 430))
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .bezelBorder
+
+        let alert = NSAlert()
+        alert.messageText = tr("statusTitle")
+        alert.accessoryView = scrollView
+        alert.addButton(withTitle: tr("close"))
+        alert.addButton(withTitle: tr("copy"))
+        if alert.runModal() == .alertSecondButtonReturn {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(report, forType: .string)
+        }
+    }
+
+    private func currentStatusReport() -> String {
+        let chinese = language == .chinese
+        let launcherPID = ProcessInfo.processInfo.processIdentifier
+        let scriptPID = launchProcess?.isRunning == true ? String(launchProcess!.processIdentifier) : (chinese ? "未运行" : "Not running")
+        let chatGPTPIDs = runningChatGPTApps().map { String($0.processIdentifier) }
+        let chatGPTStatus = chatGPTPIDs.isEmpty
+            ? (chinese ? "未运行" : "Not running")
+            : (chinese ? "运行中（PID \(chatGPTPIDs.joined(separator: ", "))）" : "Running (PID \(chatGPTPIDs.joined(separator: ", ")))")
+        let managedStatus = launchProcess?.isRunning == true
+            ? (chinese ? "运行中" : "Running")
+            : (chinese ? "未运行" : "Not running")
+
+        let snapshot = managedSessionSnapshot ?? config.proxies.first(where: { $0.id == config.activeProxy }).map {
+            ManagedSessionSnapshot(
+                chatGPTAppPath: config.chatGPTAppPath,
+                proxyName: $0.name,
+                proxyHost: $0.host,
+                proxyPort: $0.port,
+                authenticationEnabled: !$0.username.isEmpty || !$0.password.isEmpty,
+                bridgeEnabled: $0.bridge,
+                bridgeHost: config.httpBridgeHost,
+                bridgePort: config.httpBridgePort,
+                bypassItems: config.bypassItems
+            )
+        }
+        let proxyName = snapshot?.proxyName ?? (chinese ? "无" : "None")
+        let socksEndpoint = snapshot.map { "\($0.proxyHost):\($0.proxyPort)" } ?? (chinese ? "无" : "None")
+        let authentication = snapshot?.authenticationEnabled == true
+            ? (chinese ? "已启用（凭据不显示）" : "Enabled (credentials hidden)")
+            : (chinese ? "未启用" : "Disabled")
+        let bridgeEnabled = snapshot?.bridgeEnabled == true
+        let bridgeEndpoint = snapshot.map { "\($0.bridgeHost):\($0.bridgePort)" } ?? "\(config.httpBridgeHost):\(config.httpBridgePort)"
+        let environmentProxy = snapshot.map {
+            $0.bridgeEnabled
+                ? "http://\(urlHost($0.bridgeHost)):\($0.bridgePort)"
+                : "socks5h://\(urlHost($0.proxyHost)):\($0.proxyPort)"
+        } ?? (chinese ? "无" : "None")
+        let chromiumProxy = snapshot.map { "socks5://\(urlHost($0.proxyHost)):\($0.proxyPort)" } ?? (chinese ? "无" : "None")
+        let bypass = snapshot?.bypassItems.joined(separator: ", ") ?? (chinese ? "无" : "None")
+        let listener = bridgeListenerStatus(snapshot: snapshot, chinese: chinese)
+        let abnormalities = abnormalStatus(chinese: chinese)
+        let systemProxy = systemProxyStatus(chinese: chinese)
+        let launchctlProxy = launchctlProxyStatus(chinese: chinese)
+
+        if chinese {
+            return """
+            检查时间：\(DateFormatter.localizedString(from: Date(), dateStyle: .medium, timeStyle: .medium))
+
+            【启动器与 ChatGPT】
+            ChatGPT Proxy PID：\(launcherPID)
+            管理会话：\(managedStatus)
+            启动脚本 PID：\(scriptPID)
+            ChatGPT：\(chatGPTStatus)
+            ChatGPT App 路径：\(snapshot?.chatGPTAppPath ?? config.chatGPTAppPath)
+
+            【本次会话的代理配置】
+            配置名称：\(proxyName)
+            上游 SOCKS5：\(socksEndpoint)
+            SOCKS5 认证：\(authentication)
+            Chromium --proxy-server：\(chromiumProxy)
+            HTTP_PROXY / HTTPS_PROXY / ALL_PROXY：\(environmentProxy)
+            本地 HTTP bridge：\(bridgeEnabled ? "已启用（\(bridgeEndpoint)）" : "未启用")
+            直连排除：\(bypass)
+
+            【本地监听状态】
+            \(listener)
+
+            【异常信息】
+            \(abnormalities)
+
+            【本机全局状态（只读检查）】
+            系统代理：
+            \(systemProxy)
+
+            launchctl 全局代理变量：
+            \(launchctlProxy)
+
+            【ChatGPT Proxy 的修改范围】
+            系统 HTTP/HTTPS/SOCKS 代理：未修改
+            全局 launchctl 环境：未修改
+            VPN：未修改
+            DNS：未修改
+            其他应用的代理环境：未修改
+
+            说明：上面的“系统代理”和“launchctl 全局代理变量”是当前系统实际值，仅用于发现异常或其他软件的配置；ChatGPT Proxy 不写入这些位置。受管会话所有权记录从 2.1.5 build 22 开始提供，旧版本中已经消失的状态无法事后可靠归因。
+            """
+        }
+
+        return """
+        Checked: \(DateFormatter.localizedString(from: Date(), dateStyle: .medium, timeStyle: .medium))
+
+        [Launcher and ChatGPT]
+        ChatGPT Proxy PID: \(launcherPID)
+        Managed session: \(managedStatus)
+        Launch script PID: \(scriptPID)
+        ChatGPT: \(chatGPTStatus)
+        ChatGPT App path: \(snapshot?.chatGPTAppPath ?? config.chatGPTAppPath)
+
+        [Proxy settings for this session]
+        Profile: \(proxyName)
+        Upstream SOCKS5: \(socksEndpoint)
+        SOCKS5 authentication: \(authentication)
+        Chromium --proxy-server: \(chromiumProxy)
+        HTTP_PROXY / HTTPS_PROXY / ALL_PROXY: \(environmentProxy)
+        Local HTTP bridge: \(bridgeEnabled ? "Enabled (\(bridgeEndpoint))" : "Disabled")
+        Direct-connect bypasses: \(bypass)
+
+        [Local listener status]
+        \(listener)
+
+        [Abnormalities]
+        \(abnormalities)
+
+        [Machine-wide state (read-only checks)]
+        System proxies:
+        \(systemProxy)
+
+        Global launchctl proxy variables:
+        \(launchctlProxy)
+
+        [Changes made by ChatGPT Proxy]
+        System HTTP/HTTPS/SOCKS proxies: Not modified
+        Global launchctl environment: Not modified
+        VPN: Not modified
+        DNS: Not modified
+        Proxy environments of other apps: Not modified
+
+        Note: the system-proxy and launchctl sections show current machine values only to reveal abnormalities or third-party configuration. ChatGPT Proxy does not write to those locations. Managed-session ownership records are available starting with 2.1.5 build 22; state that disappeared under older versions cannot be attributed retroactively.
+        """
+    }
+
+    private func urlHost(_ host: String) -> String {
+        if host.hasPrefix("[") && host.hasSuffix("]") { return host }
+        return host.contains(":") ? "[\(host)]" : host
+    }
+
+    private func bridgeListenerStatus(snapshot: ManagedSessionSnapshot?, chinese: Bool) -> String {
+        let port = snapshot?.bridgePort ?? config.httpBridgePort
+        let host = snapshot?.bridgeHost ?? config.httpBridgeHost
+        guard Int(port) != nil else {
+            return chinese ? "异常：Bridge 端口无效：\(port)" : "Abnormal: invalid bridge port: \(port)"
+        }
+        let output = commandOutput("/usr/sbin/lsof", ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let bridgeEnabled = snapshot?.bridgeEnabled == true
+        let currentScriptPID = launchProcess?.isRunning == true ? launchProcess?.processIdentifier : nil
+        let bridgePath = store.resourcesURL.appendingPathComponent("chatgpt-socks-http-bridge").path
+        let managedBridge = proxyOwnedProcesses().first {
+            $0.command.hasPrefix(bridgePath) && $0.ppid == currentScriptPID
+        }
+
+        if bridgeEnabled, let managedBridge, !output.isEmpty {
+            return chinese
+                ? "正常：当前受管 HTTP bridge（PID \(managedBridge.pid)）正在监听 \(host):\(port)。"
+                : "Normal: the managed HTTP bridge (PID \(managedBridge.pid)) is listening on \(host):\(port)."
+        }
+        if bridgeEnabled, output.isEmpty {
+            return chinese
+                ? "异常：本次会话启用了 HTTP bridge，但 \(host):\(port) 没有监听进程。"
+                : "Abnormal: HTTP bridge is enabled for this session, but no process is listening on \(host):\(port)."
+        }
+        if bridgeEnabled {
+            return chinese
+                ? "异常：\(host):\(port) 已被非当前受管 bridge 的进程监听：\n\(output)"
+                : "Abnormal: \(host):\(port) is owned by a process other than the currently managed bridge:\n\(output)"
+        }
+        if output.isEmpty {
+            return chinese
+                ? "正常：本次会话未启用 HTTP bridge，\(host):\(port) 没有监听。"
+                : "Normal: HTTP bridge is disabled for this session and \(host):\(port) has no listener."
+        }
+        return chinese
+            ? "异常：本次会话未启用 HTTP bridge，但 \(host):\(port) 存在监听：\n\(output)"
+            : "Abnormal: HTTP bridge is disabled for this session, but \(host):\(port) has a listener:\n\(output)"
+    }
+
+    private func abnormalStatus(chinese: Bool) -> String {
+        let processes = proxyOwnedProcesses()
+        let scriptPath = store.scriptURL.path
+        let bridgePath = store.resourcesURL.appendingPathComponent("chatgpt-socks-http-bridge").path
+        let currentScriptPID = launchProcess?.isRunning == true ? launchProcess?.processIdentifier : nil
+        let scriptProcesses = processes.filter {
+            isLaunchScriptCommand($0.command, scriptPath: scriptPath)
+        }
+        let bridgeProcesses = processes.filter { $0.command.hasPrefix(bridgePath) }
+        var scriptPIDs = Set(scriptProcesses.map(\.pid))
+        if let currentScriptPID {
+            scriptPIDs.insert(currentScriptPID)
+        }
+        var findings: [String] = []
+
+        for process in scriptProcesses where process.pid != currentScriptPID {
+            findings.append(chinese
+                ? "发现当前启动器之外的 ChatGPT Proxy 启动脚本：PID \(process.pid)，PPID \(process.ppid)。"
+                : "Additional ChatGPT Proxy launch script: PID \(process.pid), PPID \(process.ppid).")
+        }
+        for process in bridgeProcesses where !scriptPIDs.contains(process.ppid) {
+            findings.append(chinese
+                ? "发现未由有效 ChatGPT Proxy 启动脚本管理的 HTTP bridge：PID \(process.pid)，PPID \(process.ppid)，路径 \(bridgePath)。"
+                : "HTTP bridge without a valid ChatGPT Proxy launch script: PID \(process.pid), PPID \(process.ppid), path \(bridgePath).")
+        }
+
+        let state = managedSessionState()
+        if let recordedPIDText = state["script_pid"],
+           let recordedPID = Int32(recordedPIDText) {
+            let matchingProcess = recordedPID == currentScriptPID || processes.contains {
+                $0.pid == recordedPID && isLaunchScriptCommand($0.command, scriptPath: scriptPath)
+            }
+            if !matchingProcess {
+                let bridgePID = state["bridge_pid"].flatMap(Int32.init).map(String.init) ?? "-"
+                let chatGPTPID = state["chatgpt_pid"].flatMap(Int32.init).map(String.init) ?? "-"
+                let endpoint = [state["bridge_host"], state["bridge_port"]].compactMap { $0 }.joined(separator: ":")
+                findings.append(chinese
+                    ? "发现未清理的受管会话记录：脚本 PID \(recordedPID)，bridge PID \(bridgePID)，ChatGPT PID \(chatGPTPID)，监听 \(endpoint.isEmpty ? "-" : endpoint)。记录文件：\(store.sessionStateURL.path)"
+                    : "Stale managed-session record: script PID \(recordedPID), bridge PID \(bridgePID), ChatGPT PID \(chatGPTPID), listener \(endpoint.isEmpty ? "-" : endpoint). State file: \(store.sessionStateURL.path)")
+            }
+        }
+
+        return findings.isEmpty
+            ? (chinese ? "未发现 ChatGPT Proxy 异常。" : "No ChatGPT Proxy abnormalities detected.")
+            : findings.joined(separator: "\n")
+    }
+
+    private func isLaunchScriptCommand(_ command: String, scriptPath: String) -> Bool {
+        command == scriptPath || command.contains(" \(scriptPath)")
+    }
+
+    private func managedSessionState() -> [String: String] {
+        guard let content = try? String(contentsOf: store.sessionStateURL, encoding: .utf8) else {
+            return [:]
+        }
+        var values: [String: String] = [:]
+        for line in content.split(separator: "\n") {
+            guard let separator = line.firstIndex(of: "=") else { continue }
+            values[String(line[..<separator])] = String(line[line.index(after: separator)...])
+        }
+        return values
+    }
+
+    private func proxyOwnedProcesses() -> [(pid: Int32, ppid: Int32, command: String)] {
+        commandOutput("/bin/ps", ["-axo", "pid=,ppid=,command="])
+            .split(separator: "\n")
+            .compactMap { line in
+                let fields = line.split(maxSplits: 2, whereSeparator: \.isWhitespace)
+                guard fields.count == 3,
+                      let pid = Int32(fields[0]),
+                      let ppid = Int32(fields[1]) else {
+                    return nil
+                }
+                return (pid: pid, ppid: ppid, command: String(fields[2]))
+            }
+    }
+
+    private func systemProxyStatus(chinese: Bool) -> String {
+        let output = commandOutput("/usr/sbin/scutil", ["--proxy"])
+        let keys = ["HTTPEnable", "HTTPProxy", "HTTPPort", "HTTPSEnable", "HTTPSProxy", "HTTPSPort", "SOCKSEnable", "SOCKSProxy", "SOCKSPort"]
+        let lines = output.split(separator: "\n").map(String.init).filter { line in
+            keys.contains { line.contains($0) }
+        }
+        let enabled = lines.contains { $0.contains("Enable : 1") }
+        if !enabled {
+            return chinese ? "HTTP / HTTPS / SOCKS 均未启用。" : "HTTP / HTTPS / SOCKS are all disabled."
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func launchctlProxyStatus(chinese: Bool) -> String {
+        let keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
+        let values = keys.compactMap { key -> String? in
+            let value = commandOutput("/bin/launchctl", ["getenv", key])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : "\(key)=\(redactedProxyValue(value))"
+        }
+        return values.isEmpty
+            ? (chinese ? "未设置。" : "Not set.")
+            : values.joined(separator: "\n")
+    }
+
+    private func redactedProxyValue(_ value: String) -> String {
+        guard let schemeRange = value.range(of: "://"),
+              let atIndex = value[schemeRange.upperBound...].firstIndex(of: "@") else {
+            return value
+        }
+        return String(value[..<schemeRange.upperBound]) + "***@" + String(value[value.index(after: atIndex)...])
+    }
+
+    private func commandOutput(_ executable: String, _ arguments: [String]) -> String {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return String(data: data, encoding: .utf8) ?? ""
+        } catch {
+            return ""
+        }
+    }
+
     @objc private func launchClicked() {
         saveFieldsToSelectedProxy()
         guard validateConfig() else { return }
@@ -980,7 +1345,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     return
                 }
             }
-            try launchChatGPT()
+            try launchChatGPT(waitForBridgeRelease: replacingManagedSession)
             launchButton.isEnabled = false
             window.orderOut(nil)
         } catch {
@@ -995,14 +1360,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func runningChatGPTApps() -> [NSRunningApplication] {
-        NSWorkspace.shared.runningApplications.filter { app in
+        let expectedPath = ((managedSessionSnapshot?.chatGPTAppPath ?? config.chatGPTAppPath) as NSString).standardizingPath
+        return NSWorkspace.shared.runningApplications.filter { app in
             if app.processIdentifier == ProcessInfo.processInfo.processIdentifier {
                 return false
             }
-            if app.bundleURL?.lastPathComponent == "ChatGPT.app" {
-                return true
+            if let bundlePath = app.bundleURL?.path {
+                return (bundlePath as NSString).standardizingPath == expectedPath
             }
-            return app.localizedName == "ChatGPT"
+            return app.localizedName == "ChatGPT" && app.bundleURL == nil
         }
     }
 
@@ -1036,7 +1402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
-    private func launchChatGPT() throws {
+    private func launchChatGPT(waitForBridgeRelease: Bool) throws {
         guard FileManager.default.isExecutableFile(atPath: store.scriptURL.path) else {
             throw NSError(domain: "ChatGPTProxyLauncher", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: String(format: tr("missingScript"), store.scriptURL.path)
@@ -1047,11 +1413,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         process.arguments = [store.scriptURL.path]
         var env = ProcessInfo.processInfo.environment
         env["CHATGPT_PROXY_SKIP_UI"] = "1"
+        env["CHATGPT_PROXY_WAIT_FOR_BRIDGE_RELEASE"] = waitForBridgeRelease ? "1" : "0"
         process.environment = env
-        process.terminationHandler = { [weak self] _ in
+        process.terminationHandler = { [weak self] terminatedProcess in
             DispatchQueue.main.async {
                 guard let self else { return }
+                guard self.launchProcess === terminatedProcess else { return }
                 self.launchProcess = nil
+                self.managedSessionSnapshot = nil
                 self.enableAutomaticTerminationIfNeeded()
                 if self.terminationRequested {
                     self.terminationRequested = false
@@ -1069,6 +1438,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             throw error
         }
         launchProcess = process
+        if let proxy = config.proxies.first(where: { $0.id == config.activeProxy }) {
+            managedSessionSnapshot = ManagedSessionSnapshot(
+                chatGPTAppPath: config.chatGPTAppPath,
+                proxyName: proxy.name,
+                proxyHost: proxy.host,
+                proxyPort: proxy.port,
+                authenticationEnabled: !proxy.username.isEmpty || !proxy.password.isEmpty,
+                bridgeEnabled: proxy.bridge,
+                bridgeHost: config.httpBridgeHost,
+                bridgePort: config.httpBridgePort,
+                bypassItems: config.bypassItems
+            )
+        }
     }
 
     private func disableAutomaticTerminationIfNeeded() {

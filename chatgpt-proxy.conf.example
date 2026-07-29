@@ -1,6 +1,9 @@
 # Active proxy id. Edit through ChatGPT Proxy, or update this file manually.
 ACTIVE_PROXY="local"
 
+# ChatGPT application bundle. Paths containing spaces are supported.
+CHATGPT_APP_PATH="/Applications/ChatGPT.app"
+
 # Configured SOCKS5 proxies.
 PROXY_IDS=(local remote)
 PROXY_LOCAL_NAME="Local SOCKS"
