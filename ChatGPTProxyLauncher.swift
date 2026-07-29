@@ -286,6 +286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let versionLabel = NSTextField(labelWithString: "")
     private let subtitleLabel = NSTextField(labelWithString: "")
     private let languageMenu = NSPopUpButton()
+    private let applicationMenuItem = NSMenuItem()
+    private let quitApplicationMenuItem = NSMenuItem()
     private let proxyTabItem = NSTabViewItem(identifier: "proxies")
     private let bypassTabItem = NSTabViewItem(identifier: "bypass")
     private let setCurrentButton = NSButton()
@@ -315,6 +317,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         config = store.load()
+        buildMainMenu()
         buildWindow()
         reloadAll()
         window.center()
@@ -332,6 +335,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         guard !terminationRequested else {
             return .terminateLater
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = tr("quitProxyTitle")
+        alert.informativeText = tr("quitProxyInfo")
+        alert.addButton(withTitle: tr("quitBoth"))
+        alert.addButton(withTitle: tr("cancel"))
+        alert.window.level = .modalPanel
+        alert.window.collectionBehavior.insert(.moveToActiveSpace)
+        NSApp.activate(ignoringOtherApps: true)
+        if let screen = NSScreen.main {
+            let visibleFrame = screen.visibleFrame
+            let alertSize = alert.window.frame.size
+            alert.window.setFrameOrigin(NSPoint(
+                x: visibleFrame.midX - alertSize.width / 2,
+                y: visibleFrame.midY - alertSize.height / 2
+            ))
+        } else {
+            alert.window.center()
+        }
+        alert.window.makeKeyAndOrderFront(nil)
+        alert.window.orderFrontRegardless()
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return .terminateCancel
         }
 
         terminationRequested = true
@@ -425,7 +453,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "quitRelaunch": "Quit and Relaunch",
             "quitFailedTitle": "ChatGPT is still running",
             "quitFailedInfo": "ChatGPT did not quit within a few seconds. Please quit it manually, then launch again.",
-            "cleanupFailed": "The previous proxy session is still cleaning up. Wait a moment, then try again."
+            "cleanupFailed": "The previous proxy session is still cleaning up. Wait a moment, then try again.",
+            "quitProxyTitle": "Quit ChatGPT Proxy?",
+            "quitProxyInfo": "ChatGPT is currently running through ChatGPT Proxy. Quitting will also close ChatGPT and stop this proxy session.",
+            "quitBoth": "Quit Both",
+            "quitApplication": "Quit ChatGPT Proxy"
         ]
         let zh: [String: String] = [
             "title": "ChatGPT Proxy",
@@ -476,13 +508,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "quitRelaunch": "退出并重启",
             "quitFailedTitle": "ChatGPT 仍在运行",
             "quitFailedInfo": "ChatGPT 在几秒内没有退出。请手动退出后再启动。",
-            "cleanupFailed": "上一次代理会话仍在清理中。请稍候片刻再重试。"
+            "cleanupFailed": "上一次代理会话仍在清理中。请稍候片刻再重试。",
+            "quitProxyTitle": "退出 ChatGPT Proxy？",
+            "quitProxyInfo": "ChatGPT 当前正通过 ChatGPT Proxy 运行。继续退出将同时关闭 ChatGPT，并结束本次代理会话。",
+            "quitBoth": "同时退出",
+            "quitApplication": "退出 ChatGPT Proxy"
         ]
         return (language == .english ? en : zh)[key] ?? key
     }
 
     private func refreshLanguage() {
         window.title = tr("title")
+        applicationMenuItem.title = tr("title")
+        applicationMenuItem.submenu?.title = tr("title")
+        quitApplicationMenuItem.title = tr("quitApplication")
         titleLabel.stringValue = tr("title")
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         versionLabel.stringValue = version.map { "v\($0)" } ?? ""
@@ -508,6 +547,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         saveButton.title = tr("save")
         launchButton.title = tr("launch")
         updateCurrentLabel()
+    }
+
+    private func buildMainMenu() {
+        let mainMenu = NSMenu()
+        let applicationMenu = NSMenu()
+        applicationMenuItem.submenu = applicationMenu
+        mainMenu.addItem(applicationMenuItem)
+
+        quitApplicationMenuItem.target = NSApp
+        quitApplicationMenuItem.action = #selector(NSApplication.terminate(_:))
+        quitApplicationMenuItem.keyEquivalent = "q"
+        applicationMenu.addItem(quitApplicationMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     private func buildWindow() {
