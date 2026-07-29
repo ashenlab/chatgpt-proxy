@@ -7,8 +7,8 @@ APP="${OUTPUT_DIR}/ChatGPT Proxy.app"
 CONTENTS="${APP}/Contents"
 RESOURCES="${CONTENTS}/Resources"
 MACOS="${CONTENTS}/MacOS"
-VERSION="2.1.2"
-BUILD="13"
+VERSION="2.1.3"
+BUILD="16"
 
 rm -rf "${APP}"
 mkdir -p "${MACOS}" "${RESOURCES}"
@@ -17,7 +17,9 @@ mkdir -p "${MACOS}" "${RESOURCES}"
   "${ROOT}/NativeSocksHTTPBridge.c" \
   -o "${RESOURCES}/chatgpt-socks-http-bridge"
 
-/usr/bin/swiftc -O -framework AppKit \
+/usr/bin/swiftc -O -target arm64-apple-macosx12.0 \
+  -module-cache-path "${OUTPUT_DIR}/SwiftModuleCache" \
+  -framework AppKit \
   "${ROOT}/ChatGPTProxyLauncher.swift" \
   -o "${MACOS}/ChatGPTProxyLauncher"
 

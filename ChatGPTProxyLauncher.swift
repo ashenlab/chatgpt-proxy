@@ -307,6 +307,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var usernameRow: NSGridRow?
     private var passwordRow: NSGridRow?
     private var launchProcess: Process?
+    private var suppressTerminationForRelaunch = false
+    private var terminationRequested = false
+    private var automaticTerminationDisabled = false
+    private let automaticTerminationReason = "Managing the active ChatGPT proxy session"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -314,12 +318,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         buildWindow()
         reloadAll()
         window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        showConfigurationWindow(reloadConfiguration: false)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         launchProcess == nil
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard launchProcess?.isRunning == true else {
+            enableAutomaticTerminationIfNeeded()
+            return .terminateNow
+        }
+        guard !terminationRequested else {
+            return .terminateLater
+        }
+
+        terminationRequested = true
+        suppressTerminationForRelaunch = false
+        for app in runningChatGPTApps() {
+            app.terminate()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, self.terminationRequested, self.launchProcess?.isRunning == true else {
+                return
+            }
+            self.terminationRequested = false
+            NSApp.reply(toApplicationShouldTerminate: false)
+            self.showError(self.tr("quitFailedTitle"), self.tr("quitFailedInfo"))
+        }
+        return .terminateLater
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if !window.isVisible {
+            showConfigurationWindow()
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showConfigurationWindow()
+        return true
+    }
+
+    private func showConfigurationWindow(reloadConfiguration: Bool = true) {
+        if reloadConfiguration {
+            config = store.load()
+            reloadAll()
+        }
+        launchButton.isEnabled = launchProcess == nil || !runningChatGPTApps().isEmpty
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
 
     private func tr(_ key: String) -> String {
@@ -371,7 +424,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "alreadyRunningInfo": "Proxy changes only apply when ChatGPT starts.\n\nQuit the running ChatGPT and relaunch with the selected proxy, or cancel and keep the current session.",
             "quitRelaunch": "Quit and Relaunch",
             "quitFailedTitle": "ChatGPT is still running",
-            "quitFailedInfo": "ChatGPT did not quit within a few seconds. Please quit it manually, then launch again."
+            "quitFailedInfo": "ChatGPT did not quit within a few seconds. Please quit it manually, then launch again.",
+            "cleanupFailed": "The previous proxy session is still cleaning up. Wait a moment, then try again."
         ]
         let zh: [String: String] = [
             "title": "ChatGPT Proxy",
@@ -421,7 +475,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "alreadyRunningInfo": "代理配置只会在 ChatGPT 启动时生效。\n\n请退出正在运行的 ChatGPT，并用当前代理配置重新启动；或取消并保留当前会话。",
             "quitRelaunch": "退出并重启",
             "quitFailedTitle": "ChatGPT 仍在运行",
-            "quitFailedInfo": "ChatGPT 在几秒内没有退出。请手动退出后再启动。"
+            "quitFailedInfo": "ChatGPT 在几秒内没有退出。请手动退出后再启动。",
+            "cleanupFailed": "上一次代理会话仍在清理中。请稍候片刻再重试。"
         ]
         return (language == .english ? en : zh)[key] ?? key
     }
@@ -456,6 +511,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func buildWindow() {
+        window.isReleasedWhenClosed = false
+        window.collectionBehavior.insert(.moveToActiveSpace)
+
         let root = NSStackView()
         root.orientation = .vertical
         root.spacing = 12
@@ -830,7 +888,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func cancelClicked() {
-        NSApp.terminate(nil)
+        if launchProcess == nil {
+            NSApp.terminate(nil)
+        } else {
+            window.orderOut(nil)
+        }
     }
 
     @objc private func saveClicked() {
@@ -849,13 +911,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard validateConfig() else { return }
         do {
             try store.save(config)
+            let replacingManagedSession = launchProcess != nil
+            suppressTerminationForRelaunch = replacingManagedSession
             if !handleRunningChatGPTIfNeeded() {
+                suppressTerminationForRelaunch = false
                 return
+            }
+            if replacingManagedSession {
+                let deadline = Date().addingTimeInterval(6)
+                while launchProcess != nil, Date() < deadline {
+                    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+                }
+                suppressTerminationForRelaunch = false
+                guard launchProcess == nil else {
+                    showError(tr("unableLaunch"), tr("cleanupFailed"))
+                    return
+                }
             }
             try launchChatGPT()
             launchButton.isEnabled = false
             window.orderOut(nil)
         } catch {
+            suppressTerminationForRelaunch = false
             launchButton.isEnabled = true
             showError(tr("unableLaunch"), error.localizedDescription)
         }
@@ -921,12 +998,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         process.environment = env
         process.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
-                self?.launchProcess = nil
-                NSApp.terminate(nil)
+                guard let self else { return }
+                self.launchProcess = nil
+                self.enableAutomaticTerminationIfNeeded()
+                if self.terminationRequested {
+                    self.terminationRequested = false
+                    NSApp.reply(toApplicationShouldTerminate: true)
+                } else if !self.suppressTerminationForRelaunch {
+                    NSApp.terminate(nil)
+                }
             }
         }
-        try process.run()
+        disableAutomaticTerminationIfNeeded()
+        do {
+            try process.run()
+        } catch {
+            enableAutomaticTerminationIfNeeded()
+            throw error
+        }
         launchProcess = process
+    }
+
+    private func disableAutomaticTerminationIfNeeded() {
+        guard !automaticTerminationDisabled else { return }
+        ProcessInfo.processInfo.disableAutomaticTermination(automaticTerminationReason)
+        automaticTerminationDisabled = true
+    }
+
+    private func enableAutomaticTerminationIfNeeded() {
+        guard automaticTerminationDisabled else { return }
+        ProcessInfo.processInfo.enableAutomaticTermination(automaticTerminationReason)
+        automaticTerminationDisabled = false
     }
 
     private func validateConfig() -> Bool {
