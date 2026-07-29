@@ -306,6 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let statusLabel = NSTextField(labelWithString: "")
     private var usernameRow: NSGridRow?
     private var passwordRow: NSGridRow?
+    private var launchProcess: Process?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -318,7 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        launchProcess == nil
     }
 
     private func tr(_ key: String) -> String {
@@ -852,8 +853,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 return
             }
             try launchChatGPT()
-            NSApp.terminate(nil)
+            launchButton.isEnabled = false
+            window.orderOut(nil)
         } catch {
+            launchButton.isEnabled = true
             showError(tr("unableLaunch"), error.localizedDescription)
         }
     }
@@ -916,7 +919,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         var env = ProcessInfo.processInfo.environment
         env["CHATGPT_PROXY_SKIP_UI"] = "1"
         process.environment = env
+        process.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.launchProcess = nil
+                NSApp.terminate(nil)
+            }
+        }
         try process.run()
+        launchProcess = process
     }
 
     private func validateConfig() -> Bool {
