@@ -12,6 +12,8 @@ DEBUG_FLAG_FILE="${SUPPORT_DIR}/diagnostics.enabled"
 SESSION_STATE_FILE="${SUPPORT_DIR}/managed-session.state"
 SESSION_STARTED_AT="$(/bin/date +%s)"
 BRIDGE_PID=""
+LAUNCH_HELPER_PID=""
+CHATGPT_PID_FILE="${SUPPORT_DIR}/chatgpt-pid.$$"
 /bin/mkdir -p "${SUPPORT_DIR}"
 /bin/chmod 700 "${SUPPORT_DIR}" >/dev/null 2>&1 || true
 for sensitive_file in "${CONFIG_FILE}" "${DEBUG_LOG_FILE}" "${SESSION_STATE_FILE}"; do
@@ -92,6 +94,7 @@ cleanup_launcher() {
   local status=$?
   trap - EXIT
   stop_bridge
+  /bin/rm -f "${CHATGPT_PID_FILE}"
   remove_session_state
 
   return "${status}"
@@ -938,8 +941,32 @@ if [[ -n "${HOST_RESOLVER_RULES}" ]]; then
 fi
 
 log_debug "launch args: $(redact_proxy_url "${CHATGPT_ARGS[*]}")"
-"${CHATGPT_EXECUTABLE}" "${CHATGPT_ARGS[@]}" >> "${DEBUG_OUTPUT}" 2>&1 &
-CHATGPT_MAIN_PID=$!
+CHATGPT_LAUNCH_HELPER="${SCRIPT_DIR}/chatgpt-launch-helper"
+if [[ ! -x "${CHATGPT_LAUNCH_HELPER}" ]]; then
+  fail "Cannot find native ChatGPT launch helper: ${CHATGPT_LAUNCH_HELPER}"
+fi
+
+/bin/rm -f "${CHATGPT_PID_FILE}"
+"${CHATGPT_LAUNCH_HELPER}" \
+  --pid-file "${CHATGPT_PID_FILE}" \
+  "${CHATGPT_APP_PATH}" \
+  -- "${CHATGPT_ARGS[@]}" >> "${DEBUG_OUTPUT}" 2>&1 &
+LAUNCH_HELPER_PID=$!
+
+for _ in {1..100}; do
+  [[ -s "${CHATGPT_PID_FILE}" ]] && break
+  /bin/kill -0 "${LAUNCH_HELPER_PID}" >/dev/null 2>&1 || break
+  sleep 0.1
+done
+if [[ ! -s "${CHATGPT_PID_FILE}" ]]; then
+  wait "${LAUNCH_HELPER_PID}" >/dev/null 2>&1 || true
+  fail "LaunchServices could not start ChatGPT. No temporary proxy environment was left active."
+fi
+CHATGPT_MAIN_PID="$(<"${CHATGPT_PID_FILE}")"
+CHATGPT_MAIN_PID="${CHATGPT_MAIN_PID//$'\n'/}"
+if [[ ! "${CHATGPT_MAIN_PID}" =~ '^[0-9]+$' ]]; then
+  fail "LaunchServices returned an invalid ChatGPT process identifier."
+fi
 OPEN_STATUS=0
 log_debug "ChatGPT main pid: ${CHATGPT_MAIN_PID}"
 write_session_state
@@ -960,8 +987,8 @@ for pid in "${(@f)$(chatgpt_process_pids)}"; do
 done
 
 if [[ "${OPEN_STATUS}" -eq 0 ]]; then
-  log_debug "waiting for ChatGPT main process ${CHATGPT_MAIN_PID}"
-  wait "${CHATGPT_MAIN_PID}" || OPEN_STATUS=$?
+  log_debug "waiting for ChatGPT main process ${CHATGPT_MAIN_PID} through LaunchServices helper ${LAUNCH_HELPER_PID}"
+  wait "${LAUNCH_HELPER_PID}" || OPEN_STATUS=$?
   log_debug "ChatGPT main process exited with status ${OPEN_STATUS}"
 fi
 

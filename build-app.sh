@@ -7,8 +7,8 @@ APP="${OUTPUT_DIR}/ChatGPT Proxy.app"
 CONTENTS="${APP}/Contents"
 RESOURCES="${CONTENTS}/Resources"
 MACOS="${CONTENTS}/MacOS"
-VERSION="2.1.6"
-BUILD="29"
+VERSION="2.1.7"
+BUILD="30"
 DEPLOYMENT_TARGET="12.0"
 MODULE_CACHE="${CHATGPT_PROXY_MODULE_CACHE_PATH:-${TMPDIR:-/tmp}/chatgpt-proxy-module-cache}"
 
@@ -25,6 +25,12 @@ mkdir -p "${MACOS}" "${RESOURCES}" "${MODULE_CACHE}"
   -framework AppKit \
   "${ROOT}/ChatGPTProxyLauncher.swift" \
   -o "${MACOS}/ChatGPTProxyLauncher"
+
+/usr/bin/swiftc -O -target "arm64-apple-macosx${DEPLOYMENT_TARGET}" \
+  -module-cache-path "${MODULE_CACHE}" \
+  -framework AppKit \
+  "${ROOT}/ChatGPTLaunchHelper.swift" \
+  -o "${RESOURCES}/chatgpt-launch-helper"
 
 cp "${ROOT}/chatgpt-proxy-launch.sh" "${RESOURCES}/"
 cp "${ROOT}/chatgpt-proxy.conf.example" "${RESOURCES}/"
@@ -57,15 +63,13 @@ cat > "${CONTENTS}/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>${BUILD}</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSMicrophoneUsageDescription</key><string>ChatGPT Proxy launches ChatGPT, which uses the microphone for voice conversations.</string>
-  <key>NSCameraUsageDescription</key><string>ChatGPT Proxy launches ChatGPT, which uses the camera for video conversations.</string>
   <key>NSLocalNetworkUsageDescription</key><string>ChatGPT Proxy connects to your local SOCKS5 proxy to start ChatGPT with per-app proxy settings.</string>
 </dict></plist>
 PLIST
 
 /usr/bin/codesign --force --deep --sign - "${APP}"
 
-for executable in "${MACOS}/ChatGPTProxyLauncher" "${RESOURCES}/chatgpt-socks-http-bridge"; do
+for executable in "${MACOS}/ChatGPTProxyLauncher" "${RESOURCES}/chatgpt-launch-helper" "${RESOURCES}/chatgpt-socks-http-bridge"; do
   minimum_version="$(/usr/bin/vtool -show-build "${executable}" | /usr/bin/awk '/minos/{print $2; exit}')"
   if [[ "${minimum_version}" != "${DEPLOYMENT_TARGET}" ]]; then
     print -u2 -- "Unexpected minimum macOS version for ${executable}: ${minimum_version:-unknown}"
