@@ -351,6 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var suppressTerminationForRelaunch = false
     private var terminationRequested = false
     private var automaticTerminationDisabled = false
+    private var statusAlert: NSAlert?
     private let automaticTerminationReason = "Managing the active ChatGPT proxy session"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -368,6 +369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        dismissStatusAlert()
         guard launchProcess?.isRunning == true else {
             enableAutomaticTerminationIfNeeded()
             return .terminateNow
@@ -1010,6 +1012,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func inspectStatusClicked() {
+        if let statusAlert {
+            NSApp.activate(ignoringOtherApps: true)
+            statusAlert.window.makeKeyAndOrderFront(nil)
+            return
+        }
+
         let report = currentStatusReport()
         let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 660, height: 430))
         textView.string = report
@@ -1031,10 +1039,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         alert.accessoryView = scrollView
         alert.addButton(withTitle: tr("close"))
         alert.addButton(withTitle: tr("copy"))
-        if alert.runModal() == .alertSecondButtonReturn {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(report, forType: .string)
+        statusAlert = alert
+        alert.beginSheetModal(for: window) { [weak self] response in
+            if response == .alertSecondButtonReturn {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(report, forType: .string)
+            }
+            self?.statusAlert = nil
+        }
+    }
+
+    private func dismissStatusAlert() {
+        guard let alert = statusAlert else { return }
+        statusAlert = nil
+        if let parent = alert.window.sheetParent {
+            parent.endSheet(alert.window, returnCode: .alertFirstButtonReturn)
+        } else {
+            alert.window.orderOut(nil)
         }
     }
 
@@ -1075,10 +1097,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         let proxyName = snapshot?.proxyName ?? (chinese ? "无" : "None")
         let socksEndpoint = snapshot.map { "\($0.proxyHost):\($0.proxyPort)" } ?? (chinese ? "无" : "None")
-        let authentication = snapshot?.authenticationEnabled == true
-            ? (chinese ? "已启用（凭据不显示）" : "Enabled (credentials hidden)")
-            : (chinese ? "未启用" : "Disabled")
         let bridgeEnabled = snapshot?.bridgeEnabled == true
+        let authentication: String
+        if snapshot?.authenticationEnabled == true {
+            if bridgeEnabled {
+                authentication = chinese
+                    ? "已配置（凭据不显示；仅供本地 HTTP bridge 使用）"
+                    : "Configured (credentials hidden; used only by the local HTTP bridge)"
+            } else {
+                authentication = chinese
+                    ? "已配置（凭据不显示），但本次未启用 bridge；Chromium 不支持 SOCKS5 认证"
+                    : "Configured (credentials hidden), but the bridge is disabled; Chromium does not support SOCKS5 authentication"
+            }
+        } else {
+            authentication = chinese ? "未配置" : "Not configured"
+        }
         let bridgeEndpoint = snapshot.map { "\($0.bridgeHost):\($0.bridgePort)" } ?? "\(config.httpBridgeHost):\(config.httpBridgePort)"
         let environmentProxy = snapshot.map {
             $0.bridgeEnabled
@@ -1136,7 +1169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             DNS：未修改
             其他应用的代理环境：未修改
 
-            说明：上面的“系统代理”和“launchctl 全局代理变量”是当前系统实际值，仅用于发现异常或其他软件的配置；ChatGPT Proxy 不写入这些位置。受管会话所有权记录从 2.1.5 build 22 开始提供，旧版本中已经消失的状态无法事后可靠归因。
+            说明：上面的“系统代理”和“launchctl 全局代理变量”仅供核对当前系统实际状态，不代表这些设置由 ChatGPT Proxy 创建，也不会仅因它们已启用就列为 ChatGPT Proxy 异常。ChatGPT Proxy 不写入这些位置。
             """
         }
 
@@ -1182,7 +1215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         DNS: Not modified
         Proxy environments of other apps: Not modified
 
-        Note: the system-proxy and launchctl sections show current machine values only to reveal abnormalities or third-party configuration. ChatGPT Proxy does not write to those locations. Managed-session ownership records are available starting with 2.1.5 build 22; state that disappeared under older versions cannot be attributed retroactively.
+        Note: the system-proxy and launchctl sections are read-only views of the current machine state. Their presence does not mean ChatGPT Proxy created them, and enabled values are not treated as ChatGPT Proxy abnormalities by themselves. ChatGPT Proxy does not write to those locations.
         """
     }
 
@@ -1213,8 +1246,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         if !managedSessionRunning {
             return chinese
-                ? "异常：当前没有受管 ChatGPT 会话，但 \(host):\(port) 存在监听：\n\(output)"
-                : "Abnormal: no managed ChatGPT session is running, but \(host):\(port) has a listener:\n\(output)"
+                ? "提示：当前没有受管 ChatGPT 会话；配置的 bridge 端口 \(host):\(port) 已被进程监听。该监听不一定来自 ChatGPT Proxy，但以后启用 bridge 时可能发生端口冲突：\n\(output)"
+                : "Notice: no managed ChatGPT session is running, but the configured bridge port \(host):\(port) has a listener. It may not belong to ChatGPT Proxy, but could cause a port conflict when the bridge is enabled later:\n\(output)"
         }
         if bridgeEnabled, let managedBridge, !output.isEmpty {
             return chinese
@@ -1237,8 +1270,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 : "Normal: HTTP bridge is disabled for this session and \(host):\(port) has no listener."
         }
         return chinese
-            ? "异常：本次会话未启用 HTTP bridge，但 \(host):\(port) 存在监听：\n\(output)"
-            : "Abnormal: HTTP bridge is disabled for this session, but \(host):\(port) has a listener:\n\(output)"
+            ? "提示：本次会话未启用 HTTP bridge；\(host):\(port) 的现有监听不属于本次会话，也不会被本次会话使用：\n\(output)"
+            : "Notice: HTTP bridge is disabled for this session. The existing listener on \(host):\(port) does not belong to this session and is not used by it:\n\(output)"
     }
 
     private func sessionRecordStatus(managedSessionRunning: Bool, chinese: Bool) -> String {
