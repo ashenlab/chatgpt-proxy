@@ -293,7 +293,7 @@ final class ConfigStore {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private lazy var store = ConfigStore(bundleURL: Bundle.main.bundleURL)
     private var config = LauncherConfig()
     private var language = AppLanguage(rawValue: UserDefaults.standard.string(forKey: "AppLanguage") ?? "en") ?? .english
@@ -351,7 +351,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var suppressTerminationForRelaunch = false
     private var terminationRequested = false
     private var automaticTerminationDisabled = false
-    private var statusAlert: NSAlert?
+    private var statusWindow: NSWindow?
+    private var statusReport = ""
     private let automaticTerminationReason = "Managing the active ChatGPT proxy session"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -369,7 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        dismissStatusAlert()
+        dismissStatusWindow()
         guard launchProcess?.isRunning == true else {
             enableAutomaticTerminationIfNeeded()
             return .terminateNow
@@ -1012,13 +1013,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func inspectStatusClicked() {
-        if let statusAlert {
+        if let statusWindow, statusWindow.isVisible {
             NSApp.activate(ignoringOtherApps: true)
-            statusAlert.window.makeKeyAndOrderFront(nil)
+            statusWindow.makeKeyAndOrderFront(nil)
+            statusWindow.orderFrontRegardless()
             return
         }
 
         let report = currentStatusReport()
+        statusReport = report
         let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 660, height: 430))
         textView.string = report
         textView.isEditable = false
@@ -1029,35 +1032,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         textView.isHorizontallyResizable = false
         textView.textContainer?.widthTracksTextView = true
 
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 660, height: 430))
+        let scrollView = NSScrollView()
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        let alert = NSAlert()
-        alert.messageText = tr("statusTitle")
-        alert.accessoryView = scrollView
-        alert.addButton(withTitle: tr("close"))
-        alert.addButton(withTitle: tr("copy"))
-        statusAlert = alert
-        alert.beginSheetModal(for: window) { [weak self] response in
-            if response == .alertSecondButtonReturn {
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                pasteboard.setString(report, forType: .string)
-            }
-            self?.statusAlert = nil
-        }
+        let closeButton = NSButton(title: tr("close"), target: self, action: #selector(closeStatusWindow(_:)))
+        closeButton.keyEquivalent = "\r"
+        let copyButton = NSButton(title: tr("copy"), target: self, action: #selector(copyStatusReport(_:)))
+        let buttonRow = NSStackView(views: [copyButton, closeButton])
+        buttonRow.orientation = .horizontal
+        buttonRow.spacing = 8
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let contentView = NSView()
+        contentView.addSubview(scrollView)
+        contentView.addSubview(buttonRow)
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
+            scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            scrollView.bottomAnchor.constraint(equalTo: buttonRow.topAnchor, constant: -12),
+            buttonRow.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            buttonRow.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -14)
+        ])
+
+        let statusWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 520),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        statusWindow.title = tr("statusTitle")
+        statusWindow.contentView = contentView
+        statusWindow.isReleasedWhenClosed = false
+        statusWindow.delegate = self
+        statusWindow.minSize = NSSize(width: 560, height: 360)
+        statusWindow.collectionBehavior.insert(.moveToActiveSpace)
+        statusWindow.center()
+        self.statusWindow = statusWindow
+        NSApp.activate(ignoringOtherApps: true)
+        statusWindow.makeKeyAndOrderFront(nil)
+        statusWindow.orderFrontRegardless()
     }
 
-    private func dismissStatusAlert() {
-        guard let alert = statusAlert else { return }
-        statusAlert = nil
-        if let parent = alert.window.sheetParent {
-            parent.endSheet(alert.window, returnCode: .alertFirstButtonReturn)
-        } else {
-            alert.window.orderOut(nil)
-        }
+    @objc private func closeStatusWindow(_ sender: Any?) {
+        dismissStatusWindow()
+    }
+
+    @objc private func copyStatusReport(_ sender: Any?) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(statusReport, forType: .string)
+        dismissStatusWindow()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let closedWindow = notification.object as? NSWindow, closedWindow === statusWindow else { return }
+        statusWindow = nil
+        statusReport = ""
+    }
+
+    private func dismissStatusWindow() {
+        statusWindow?.close()
+        statusWindow = nil
+        statusReport = ""
     }
 
     private func currentStatusReport() -> String {
