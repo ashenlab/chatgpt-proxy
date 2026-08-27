@@ -406,7 +406,7 @@ save_config() {
 
     print -r -- '# Local HTTP CONNECT bridge used when a proxy enables HTTP bridge mode.'
     print -r -- "HTTP_BRIDGE_HOST=$(config_quote "${HTTP_BRIDGE_HOST:-127.0.0.1}")"
-    print -r -- "HTTP_BRIDGE_PORT=$(config_quote "${HTTP_BRIDGE_PORT:-28083}")"
+    print -r -- "HTTP_BRIDGE_PORT=$(config_quote "${HTTP_BRIDGE_PORT:-23001}")"
     print -r -- ''
     print -r -- '# Hosts, domains, IPs, or CIDRs that should connect directly.'
     print -r -- '# This starts with local/LAN defaults, but every item is editable in the launcher.'
@@ -845,7 +845,7 @@ cleanup_unmanaged_chatgpt_processes
 
 if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
   BRIDGE_HOST="${HTTP_BRIDGE_HOST:-127.0.0.1}"
-  BRIDGE_PORT="${HTTP_BRIDGE_PORT:-28083}"
+  BRIDGE_PORT="${HTTP_BRIDGE_PORT:-23001}"
   case "${BRIDGE_HOST}" in
     127.0.0.1|localhost|::1) ;;
     *) fail "Bridge host must be a loopback address: 127.0.0.1, localhost, or ::1." ;;

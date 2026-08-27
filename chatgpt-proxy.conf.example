@@ -22,7 +22,7 @@ PROXY_REMOTE_HTTP_BRIDGE="1"
 
 # Local HTTP CONNECT bridge used when a proxy enables HTTP bridge mode.
 HTTP_BRIDGE_HOST="127.0.0.1"
-HTTP_BRIDGE_PORT="28083"
+HTTP_BRIDGE_PORT="23001"
 
 # Hosts, domains, IPs, or CIDRs that should connect directly.
 BYPASS_ITEMS=("localhost" "127.0.0.1" "::1" "*.local" "local" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "169.254.0.0/16" "fc00::/7" "fe80::/10")

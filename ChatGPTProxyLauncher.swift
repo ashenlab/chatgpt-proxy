@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 
 struct ProxyConfig {
     var id: String
@@ -15,7 +16,7 @@ struct LauncherConfig {
     var chatGPTAppPath: String = "/Applications/ChatGPT.app"
     var proxies: [ProxyConfig] = []
     var httpBridgeHost: String = "127.0.0.1"
-    var httpBridgePort: String = "28083"
+    var httpBridgePort: String = "23001"
     var bypassItems: [String] = []
 }
 
@@ -159,7 +160,7 @@ final class ConfigStore {
             chatGPTAppPath: parseScalar(values["CHATGPT_APP_PATH"] ?? "\"/Applications/ChatGPT.app\""),
             proxies: proxies,
             httpBridgeHost: parseScalar(values["HTTP_BRIDGE_HOST"] ?? "\"127.0.0.1\""),
-            httpBridgePort: parseScalar(values["HTTP_BRIDGE_PORT"] ?? "\"28083\""),
+            httpBridgePort: parseScalar(values["HTTP_BRIDGE_PORT"] ?? "\"23001\""),
             bypassItems: bypass.isEmpty ? defaultBypassItems() : bypass
         )
     }
@@ -506,6 +507,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "bridgeHostInvalidInfo": "Use a loopback host: 127.0.0.1, localhost, or ::1.",
             "bridgePortInvalid": "Bridge port is invalid",
             "bridgePortInvalidInfo": "Use a bridge port from 1 to 65535.",
+            "bridgeConflictTitle": "Local bridge port is already in use",
+            "bridgeConflictManagedInfo": "The proxy has not started because %@ is still used by a previous ChatGPT Proxy process (PID %@). You can safely stop that previous process and retry, or use the available port %@ instead.",
+            "bridgeConflictOtherInfo": "The proxy has not started because %@ is used by another process (PID %@). ChatGPT Proxy will not stop a process it cannot safely identify. You can use the available port %@ instead.",
+            "cleanupAndRetry": "Clean Up and Retry",
+            "useRecommendedPort": "Use Port %@",
+            "bridgeCleanupFailed": "The previous listener did not stop in time. You can use the available port %@ instead.",
             "unableLaunch": "Unable to launch ChatGPT",
             "missingScript": "Cannot find executable script:\n%@",
             "alreadyRunningTitle": "ChatGPT is already running",
@@ -566,6 +573,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "bridgeHostInvalidInfo": "请使用回环主机：127.0.0.1、localhost 或 ::1。",
             "bridgePortInvalid": "Bridge 端口无效",
             "bridgePortInvalidInfo": "请输入 1 到 65535 之间的 Bridge 端口。",
+            "bridgeConflictTitle": "本地 bridge 端口已被占用",
+            "bridgeConflictManagedInfo": "代理尚未启动，因为 %@ 仍被之前的 ChatGPT Proxy 进程占用（PID %@）。你可以安全清理该进程后重试，也可以改用空闲端口 %@。",
+            "bridgeConflictOtherInfo": "代理尚未启动，因为 %@ 已被其他进程占用（PID %@）。ChatGPT Proxy 不会关闭无法安全确认来源的进程，你可以改用空闲端口 %@。",
+            "cleanupAndRetry": "清理并重试",
+            "useRecommendedPort": "使用端口 %@",
+            "bridgeCleanupFailed": "之前的监听未能及时停止，你可以改用空闲端口 %@。",
             "unableLaunch": "无法启动 ChatGPT",
             "missingScript": "找不到可执行脚本：\n%@",
             "alreadyRunningTitle": "ChatGPT 已经在运行",
@@ -1560,6 +1573,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             try store.save(config)
             let replacingManagedSession = launchProcess != nil
             suppressTerminationForRelaunch = replacingManagedSession
+            if !replacingManagedSession, !resolveBridgePortConflictIfNeeded() {
+                suppressTerminationForRelaunch = false
+                return
+            }
             if !handleRunningChatGPTIfNeeded() {
                 suppressTerminationForRelaunch = false
                 return
@@ -1575,6 +1592,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
                     return
                 }
             }
+            if replacingManagedSession, !resolveBridgePortConflictIfNeeded() {
+                suppressTerminationForRelaunch = false
+                return
+            }
             try launchChatGPT(waitForBridgeRelease: replacingManagedSession)
             launchButton.isEnabled = false
             window.orderOut(nil)
@@ -1583,6 +1604,129 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             launchButton.isEnabled = true
             showError(tr("unableLaunch"), error.localizedDescription)
         }
+    }
+
+    private func resolveBridgePortConflictIfNeeded() -> Bool {
+        guard config.proxies.first(where: { $0.id == config.activeProxy })?.bridge == true,
+              let port = Int(config.httpBridgePort) else { return true }
+
+        let listenerPIDs = bridgeListenerPIDs(port: port)
+        guard !listenerPIDs.isEmpty else { return true }
+
+        let processes = proxyOwnedProcesses()
+        let processByPID = Dictionary(uniqueKeysWithValues: processes.map { ($0.pid, $0) })
+        let scriptPath = store.scriptURL.path
+        let bridgePath = store.resourcesURL.appendingPathComponent("chatgpt-socks-http-bridge").path
+        let launcherPath = Bundle.main.executableURL?.path ?? ""
+        var safeTargets = Set<Int32>()
+
+        for listenerPID in listenerPIDs {
+            guard let listener = processByPID[listenerPID], listener.command.hasPrefix(bridgePath) else { continue }
+            if let parent = processByPID[listener.ppid],
+               isLaunchScriptCommand(parent.command, scriptPath: scriptPath) {
+                let owningLauncher = processByPID[parent.ppid]
+                let hasValidLauncher = owningLauncher?.command.hasPrefix(launcherPath) == true
+                if !hasValidLauncher && parent.pid != launchProcess?.processIdentifier {
+                    safeTargets.insert(parent.pid)
+                }
+            } else {
+                safeTargets.insert(listener.pid)
+            }
+        }
+
+        let recommendedPort = nextAvailableBridgePort(after: port)
+        let endpoint = "\(config.httpBridgeHost):\(port)"
+        let pidList = listenerPIDs.sorted().map(String.init).joined(separator: ", ")
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = tr("bridgeConflictTitle")
+
+        if !safeTargets.isEmpty {
+            alert.informativeText = String(
+                format: tr("bridgeConflictManagedInfo"),
+                endpoint,
+                pidList,
+                String(recommendedPort)
+            )
+            alert.addButton(withTitle: tr("cleanupAndRetry"))
+            alert.addButton(withTitle: String(format: tr("useRecommendedPort"), String(recommendedPort)))
+            alert.addButton(withTitle: tr("cancel"))
+
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                for pid in safeTargets {
+                    Darwin.kill(pid, SIGTERM)
+                }
+                let deadline = Date().addingTimeInterval(3)
+                while Date() < deadline {
+                    if bridgeListenerPIDs(port: port).isEmpty { return true }
+                    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+                }
+                return offerRecommendedBridgePort(
+                    recommendedPort,
+                    message: String(format: tr("bridgeCleanupFailed"), String(recommendedPort))
+                )
+            case .alertSecondButtonReturn:
+                return applyRecommendedBridgePort(recommendedPort)
+            default:
+                return false
+            }
+        }
+
+        alert.informativeText = String(
+            format: tr("bridgeConflictOtherInfo"),
+            endpoint,
+            pidList,
+            String(recommendedPort)
+        )
+        alert.addButton(withTitle: String(format: tr("useRecommendedPort"), String(recommendedPort)))
+        alert.addButton(withTitle: tr("cancel"))
+        return alert.runModal() == .alertFirstButtonReturn
+            ? applyRecommendedBridgePort(recommendedPort)
+            : false
+    }
+
+    private func offerRecommendedBridgePort(_ port: Int, message: String) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = tr("bridgeConflictTitle")
+        alert.informativeText = message
+        alert.addButton(withTitle: String(format: tr("useRecommendedPort"), String(port)))
+        alert.addButton(withTitle: tr("cancel"))
+        return alert.runModal() == .alertFirstButtonReturn
+            ? applyRecommendedBridgePort(port)
+            : false
+    }
+
+    private func applyRecommendedBridgePort(_ port: Int) -> Bool {
+        config.httpBridgePort = String(port)
+        bridgePortField.stringValue = String(port)
+        do {
+            try store.save(config)
+            return true
+        } catch {
+            showError(tr("unableLaunch"), error.localizedDescription)
+            return false
+        }
+    }
+
+    private func nextAvailableBridgePort(after port: Int) -> Int {
+        let preferredStart = port < 65535 ? port + 1 : 1024
+        for candidate in preferredStart...65535 where bridgeListenerPIDs(port: candidate).isEmpty {
+            return candidate
+        }
+        if preferredStart > 1024 {
+            for candidate in 1024..<preferredStart where bridgeListenerPIDs(port: candidate).isEmpty {
+                return candidate
+            }
+        }
+        return port
+    }
+
+    private func bridgeListenerPIDs(port: Int) -> [Int32] {
+        commandOutput("/usr/sbin/lsof", ["-nP", "-t", "-iTCP:\(port)", "-sTCP:LISTEN"])
+            .split(whereSeparator: \.isNewline)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     }
 
     private func clearStatus() {
