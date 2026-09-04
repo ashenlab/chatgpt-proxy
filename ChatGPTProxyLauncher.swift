@@ -36,6 +36,7 @@ struct StatusReportInput {
     let chinese: Bool
     let launcherPID: Int32
     let managedSessionRunning: Bool
+    let launchInProgress: Bool
     let currentScriptPID: Int32?
     let sessionSnapshot: ManagedSessionSnapshot?
     let configuredChatGPTAppPath: String
@@ -364,6 +365,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     private var passwordRow: NSGridRow?
     private var launchProcess: Process?
     private var managedSessionSnapshot: ManagedSessionSnapshot?
+    private var managedChatGPTPID: Int32?
+    private var launchAttemptID: UUID?
     private var suppressTerminationForRelaunch = false
     private var terminationRequested = false
     private var automaticTerminationDisabled = false
@@ -390,11 +393,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         dismissStatusWindow()
-        guard launchProcess?.isRunning == true else {
+        guard let activeLaunchProcess = launchProcess, activeLaunchProcess.isRunning else {
             enableAutomaticTerminationIfNeeded()
             return .terminateNow
         }
         guard !terminationRequested else {
+            return .terminateLater
+        }
+
+        if currentManagedChatGPTPID(for: activeLaunchProcess) == nil {
+            terminationRequested = true
+            suppressTerminationForRelaunch = false
+            stopStartingSession(activeLaunchProcess)
             return .terminateLater
         }
 
@@ -493,6 +503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "current": "Current",
             "none": "None",
             "saved": "Saved.",
+            "checkingProxy": "Checking proxy connection…",
             "addBypassTitle": "Add Bypass",
             "addBypassInfo": "Enter a host, domain, wildcard domain, IP, or CIDR.",
             "proxyNameRequired": "Proxy name is required",
@@ -514,6 +525,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "useRecommendedPort": "Use Port %@",
             "bridgeCleanupFailed": "The previous listener did not stop in time. You can use the available port %@ instead.",
             "unableLaunch": "Unable to launch ChatGPT",
+            "launchFailedFallback": "The proxy session ended before ChatGPT could start.",
             "missingScript": "Cannot find executable script:\n%@",
             "alreadyRunningTitle": "ChatGPT is already running",
             "alreadyRunningInfo": "Proxy changes only apply when ChatGPT starts.\n\nQuit the running ChatGPT and relaunch with the selected proxy, or cancel and keep the current session.",
@@ -559,6 +571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "current": "当前",
             "none": "无",
             "saved": "已保存。",
+            "checkingProxy": "正在检查代理连接…",
             "addBypassTitle": "添加直连排除",
             "addBypassInfo": "输入主机名、域名、通配域名、IP 或 CIDR。",
             "proxyNameRequired": "代理名称不能为空",
@@ -580,6 +593,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "useRecommendedPort": "使用端口 %@",
             "bridgeCleanupFailed": "之前的监听未能及时停止，你可以改用空闲端口 %@。",
             "unableLaunch": "无法启动 ChatGPT",
+            "launchFailedFallback": "代理会话在 ChatGPT 启动前已经结束。",
             "missingScript": "找不到可执行脚本：\n%@",
             "alreadyRunningTitle": "ChatGPT 已经在运行",
             "alreadyRunningInfo": "代理配置只会在 ChatGPT 启动时生效。\n\n请退出正在运行的 ChatGPT，并用当前代理配置重新启动；或取消并保留当前会话。",
@@ -1160,7 +1174,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
 
     private func makeStatusReportInput() -> StatusReportInput {
         let currentScriptPID = launchProcess?.isRunning == true ? launchProcess?.processIdentifier : nil
-        let managedSessionRunning = currentScriptPID != nil && managedSessionSnapshot != nil
+        let currentManagedPID = launchProcess.flatMap { process in
+            process.isRunning ? currentManagedChatGPTPID(for: process) : nil
+        }
+        let managedSessionRunning = currentManagedPID != nil && managedSessionSnapshot != nil
+        let launchInProgress = currentScriptPID != nil && !managedSessionRunning
         let sessionSnapshot = managedSessionSnapshot ?? config.proxies.first(where: { $0.id == config.activeProxy }).map {
             ManagedSessionSnapshot(
                 chatGPTAppPath: config.chatGPTAppPath,
@@ -1178,6 +1196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             chinese: language == .chinese,
             launcherPID: ProcessInfo.processInfo.processIdentifier,
             managedSessionRunning: managedSessionRunning,
+            launchInProgress: launchInProgress,
             currentScriptPID: currentScriptPID,
             sessionSnapshot: sessionSnapshot,
             configuredChatGPTAppPath: config.chatGPTAppPath,
@@ -1196,13 +1215,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     ) -> String {
         let chinese = input.chinese
         let managedSessionRunning = input.managedSessionRunning
-        let scriptPID = managedSessionRunning
-            ? String(input.currentScriptPID!)
-            : (chinese ? "未运行" : "Not running")
+        let launchInProgress = input.launchInProgress
+        let scriptPID = input.currentScriptPID.map(String.init)
+            ?? (chinese ? "未运行" : "Not running")
         let chatGPTPIDs = input.runningChatGPTPIDs.map(String.init)
         let chatGPTStatus: String
         if chatGPTPIDs.isEmpty {
-            chatGPTStatus = chinese ? "未启动" : "Not running"
+            chatGPTStatus = launchInProgress
+                ? (chinese ? "尚未启动（正在检查代理）" : "Not started yet (checking proxy)")
+                : (chinese ? "未启动" : "Not running")
         } else if managedSessionRunning {
             chatGPTStatus = chinese
                 ? "由当前 ChatGPT Proxy 启动，运行中（PID \(chatGPTPIDs.joined(separator: ", "))）"
@@ -1212,9 +1233,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
                 ? "运行中，但不是由当前 ChatGPT Proxy 会话启动（PID \(chatGPTPIDs.joined(separator: ", "))）"
                 : "Running, but not launched by the current ChatGPT Proxy session (PID \(chatGPTPIDs.joined(separator: ", ")))"
         }
-        let managedStatus = managedSessionRunning
-            ? (chinese ? "运行中" : "Running")
-            : (chinese ? "未运行" : "Not running")
+        let managedStatus = launchInProgress
+            ? (chinese ? "正在启动" : "Starting")
+            : (managedSessionRunning
+                ? (chinese ? "运行中" : "Running")
+                : (chinese ? "未运行" : "Not running"))
+        let proxySectionTitle = launchInProgress
+            ? (chinese ? "【正在检查的代理配置】" : "[Proxy settings being checked]")
+            : (managedSessionRunning
+                ? (chinese ? "【本次受管会话的代理配置】" : "[Proxy settings for this managed session]")
+                : (chinese ? "【当前选择的代理配置（尚未应用）】" : "[Currently selected proxy settings (not applied)]"))
 
         let snapshot = input.sessionSnapshot
         let proxyName = snapshot?.proxyName ?? (chinese ? "无" : "None")
@@ -1259,7 +1287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             ChatGPT：\(chatGPTStatus)
             ChatGPT App 路径：\(snapshot?.chatGPTAppPath ?? input.configuredChatGPTAppPath)
 
-            \(managedSessionRunning ? "【本次受管会话的代理配置】" : "【当前选择的代理配置（尚未应用）】")
+            \(proxySectionTitle)
             配置名称：\(proxyName)
             上游 SOCKS5：\(socksEndpoint)
             SOCKS5 认证：\(authentication)
@@ -1305,7 +1333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         ChatGPT: \(chatGPTStatus)
         ChatGPT App path: \(snapshot?.chatGPTAppPath ?? input.configuredChatGPTAppPath)
 
-        \(managedSessionRunning ? "[Proxy settings for this managed session]" : "[Currently selected proxy settings (not applied)]")
+        \(proxySectionTitle)
         Profile: \(proxyName)
         Upstream SOCKS5: \(socksEndpoint)
         SOCKS5 authentication: \(authentication)
@@ -1359,16 +1387,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         let output = commandOutput("/usr/sbin/lsof", ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let bridgeEnabled = input.sessionSnapshot?.bridgeEnabled == true
+        let sessionActive = input.managedSessionRunning || input.launchInProgress
         let managedBridge = processes.first {
             $0.command.hasPrefix(input.bridgePath) && $0.ppid == input.currentScriptPID
         }
 
-        if !input.managedSessionRunning, output.isEmpty {
+        if !sessionActive, output.isEmpty {
             return chinese
                 ? "正常：当前未启动受管 ChatGPT 会话，不需要 HTTP bridge 监听。"
                 : "Normal: no managed ChatGPT session is running, so no HTTP bridge listener is required."
         }
-        if !input.managedSessionRunning {
+        if !sessionActive {
             return chinese
                 ? "提示：当前没有受管 ChatGPT 会话；配置的 bridge 端口 \(host):\(port) 已被进程监听。该监听不一定来自 ChatGPT Proxy，但以后启用 bridge 时可能发生端口冲突：\n\(output)"
                 : "Notice: no managed ChatGPT session is running, but the configured bridge port \(host):\(port) has a listener. It may not belong to ChatGPT Proxy, but could cause a port conflict when the bridge is enabled later:\n\(output)"
@@ -1412,10 +1441,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         let matchingProcess = recordedPID == input.currentScriptPID || processes.contains {
             $0.pid == recordedPID && isLaunchScriptCommand($0.command, scriptPath: input.scriptPath)
         }
-        if input.managedSessionRunning && matchingProcess {
+        if (input.managedSessionRunning || input.launchInProgress) && matchingProcess {
             return chinese
-                ? "当前受管会话记录正常（启动脚本 PID \(recordedPID)）。"
-                : "The current managed-session record is normal (launch script PID \(recordedPID))."
+                ? "当前会话记录正常（启动脚本 PID \(recordedPID)）。"
+                : "The current session record is normal (launch script PID \(recordedPID))."
         }
 
         let recordedBridgePID = state["bridge_pid"].flatMap(Int32.init)
@@ -1598,7 +1627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             }
             try launchChatGPT(waitForBridgeRelease: replacingManagedSession)
             launchButton.isEnabled = false
-            window.orderOut(nil)
+            statusLabel.stringValue = tr("checkingProxy")
         } catch {
             suppressTerminationForRelaunch = false
             launchButton.isEnabled = true
@@ -1783,24 +1812,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             ])
         }
         let process = Process()
+        let errorPipe = Pipe()
+        let attemptID = UUID()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = [store.scriptURL.path]
         var env = ProcessInfo.processInfo.environment
         env["CHATGPT_PROXY_SKIP_UI"] = "1"
         env["CHATGPT_PROXY_WAIT_FOR_BRIDGE_RELEASE"] = waitForBridgeRelease ? "1" : "0"
         process.environment = env
+        process.standardError = errorPipe
         process.terminationHandler = { [weak self] terminatedProcess in
+            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let launchError = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             DispatchQueue.main.async {
                 guard let self else { return }
                 guard self.launchProcess === terminatedProcess else { return }
                 self.launchProcess = nil
                 self.managedSessionSnapshot = nil
+                self.managedChatGPTPID = nil
+                self.launchAttemptID = nil
+                self.launchButton.isEnabled = true
+                self.statusLabel.stringValue = ""
                 self.enableAutomaticTerminationIfNeeded()
                 if self.terminationRequested {
                     self.terminationRequested = false
                     NSApp.reply(toApplicationShouldTerminate: true)
                 } else if !self.suppressTerminationForRelaunch {
-                    NSApp.terminate(nil)
+                    if terminatedProcess.terminationStatus == 0 {
+                        NSApp.terminate(nil)
+                    } else {
+                        self.showConfigurationWindow(reloadConfiguration: false)
+                        self.showError(
+                            self.tr("unableLaunch"),
+                            launchError?.isEmpty == false ? launchError! : self.tr("launchFailedFallback")
+                        )
+                    }
                 }
             }
         }
@@ -1812,6 +1859,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             throw error
         }
         launchProcess = process
+        launchAttemptID = attemptID
+        managedChatGPTPID = nil
         if let proxy = config.proxies.first(where: { $0.id == config.activeProxy }) {
             managedSessionSnapshot = ManagedSessionSnapshot(
                 chatGPTAppPath: config.chatGPTAppPath,
@@ -1824,6 +1873,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
                 bridgePort: config.httpBridgePort,
                 bypassItems: config.bypassItems
             )
+        }
+        watchForManagedChatGPT(process: process, attemptID: attemptID)
+    }
+
+    private func watchForManagedChatGPT(process: Process, attemptID: UUID) {
+        guard launchProcess === process, launchAttemptID == attemptID, process.isRunning else { return }
+        if let pid = currentManagedChatGPTPID(for: process) {
+            managedChatGPTPID = pid
+            statusLabel.stringValue = ""
+            window.orderOut(nil)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak process] in
+            guard let self, let process else { return }
+            self.watchForManagedChatGPT(process: process, attemptID: attemptID)
+        }
+    }
+
+    private func currentManagedChatGPTPID(for process: Process) -> Int32? {
+        if let managedChatGPTPID, Darwin.kill(managedChatGPTPID, 0) == 0 {
+            return managedChatGPTPID
+        }
+        let state = managedSessionState()
+        guard state["script_pid"] == String(process.processIdentifier),
+              let pidText = state["chatgpt_pid"],
+              let pid = Int32(pidText),
+              Darwin.kill(pid, 0) == 0 else {
+            return nil
+        }
+        return pid
+    }
+
+    private func stopStartingSession(_ process: Process) {
+        let state = managedSessionState()
+        if state["script_pid"] == String(process.processIdentifier),
+           let bridgePIDText = state["bridge_pid"],
+           let bridgePID = Int32(bridgePIDText) {
+            let bridgePath = store.resourcesURL.appendingPathComponent("chatgpt-socks-http-bridge").path
+            if proxyOwnedProcesses().contains(where: {
+                $0.pid == bridgePID && $0.ppid == process.processIdentifier && $0.command.hasPrefix(bridgePath)
+            }) {
+                Darwin.kill(bridgePID, SIGTERM)
+            }
+        }
+        process.terminate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak process] in
+            guard let process, process.isRunning else { return }
+            Darwin.kill(process.processIdentifier, SIGKILL)
         }
     }
 

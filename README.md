@@ -54,9 +54,9 @@ ChatGPT 通过 macOS LaunchServices 以自身应用身份启动，同时只接�
 
 只有当 SOCKS5 服务器通过当前 Mac 的 Wi-Fi 或以太网直接位于同一局域网时，macOS 15 及以上版本才可能要求在 `系统设置 > 隐私与安全性 > 本地网络` 中允许 ChatGPT Proxy。公网 IPv4、全球单播 IPv6、`127.0.0.1`/`localhost`，以及经 VPN 路由而不是本地链路到达的代理通常不需要这项权限。本地 HTTP bridge 自身只监听回环地址；触发权限的是 bridge 向局域网 SOCKS5 服务器发起的连接。
 
-“当前状态”会区分 ChatGPT 未启动、由当前 ChatGPT Proxy 会话启动，以及已运行但并非由当前会话启动三种情况。没有启动受管会话时，不需要 bridge 监听，当前选择的代理配置会明确标记为“尚未应用”，不会被误报为异常。异常退出后可能留下仅用于诊断的上次会话状态文件；如果其中记录的脚本、bridge 和 ChatGPT 都已结束，状态页会将它显示为无影响的“会话记录”，而不是异常。只有相关进程或监听仍然存在时才会列入“异常信息”。
+“当前状态”会区分正在检查代理、ChatGPT 未启动、由当前 ChatGPT Proxy 会话启动，以及已运行但并非由当前会话启动等情况。没有启动受管会话时，不需要 bridge 监听，当前选择的代理配置会明确标记为“尚未应用”，不会被误报为异常。异常退出后可能留下仅用于诊断的上次会话状态文件；如果其中记录的脚本、bridge 和 ChatGPT 都已结束，状态页会将它显示为无影响的“会话记录”，而不是异常。只有相关进程或监听仍然存在时才会列入“异常信息”。
 
-启动器会在打开 ChatGPT 前通过 bridge 做一次真实连接测试；失败时不会继续打开一个无法显示账户、额度、对话或插件市场的窗口。直接局域网 SOCKS5 的失败通常应检查 ChatGPT Proxy 的本地网络权限、SOCKS5 服务和上游链路。临时签名版本升级后，macOS 偶尔可能再次要求确认此权限；旧版迁移用户还可能看到 `CodexProxyLauncher` 名称。
+启动器会在打开 ChatGPT 前通过 bridge 做一次真实连接测试；失败时不会继续打开一个无法显示账户、额度、对话或插件市场的窗口。检测期间配置窗口会显示当前进度；失败信息由启动器置顶显示，检测脚本和临时 bridge 随即清理。此阶段退出启动器不会误报 ChatGPT 正在运行，也不会显示“同时退出 ChatGPT”的确认。直接局域网 SOCKS5 的失败通常应检查 ChatGPT Proxy 的本地网络权限、SOCKS5 服务和上游链路。临时签名版本升级后，macOS 偶尔可能再次要求确认此权限；旧版迁移用户还可能看到 `CodexProxyLauncher` 名称。
 
 ## 配置与隐私
 
@@ -158,9 +158,9 @@ ChatGPT is launched through macOS LaunchServices under its own application ident
 
 Local Network permission is only relevant when the SOCKS5 server is directly reachable on the same Wi-Fi or Ethernet LAN. Public IPv4 addresses, globally routable IPv6 addresses, `127.0.0.1`/`localhost`, and proxies reached through a VPN rather than the local link normally do not require it. The HTTP bridge itself listens only on loopback; the permission applies to its outbound connection to a LAN SOCKS5 server.
 
-**Current Status** distinguishes ChatGPT not running, running under the current managed session, and running independently of the current ChatGPT Proxy session. When no managed session has been launched, no bridge listener is required and the selected proxy profile is explicitly labeled as not applied instead of being reported as abnormal. An unexpected exit may leave a previous-session state file used only for diagnostics. If its recorded launch script, bridge, and ChatGPT processes have all ended, the status page presents it as a harmless **Session record**, not an abnormality. It is listed under **Abnormalities** only when a related process or listener is still active.
+**Current Status** distinguishes a proxy check in progress, ChatGPT not running, running under the current managed session, and running independently of the current ChatGPT Proxy session. When no managed session has been launched, no bridge listener is required and the selected proxy profile is explicitly labeled as not applied instead of being reported as abnormal. An unexpected exit may leave a previous-session state file used only for diagnostics. If its recorded launch script, bridge, and ChatGPT processes have all ended, the status page presents it as a harmless **Session record**, not an abnormality. It is listed under **Abnormalities** only when a related process or listener is still active.
 
-On macOS 15 or later, allow ChatGPT Proxy under **System Settings > Privacy & Security > Local Network** when that LAN case applies. Before opening ChatGPT, the launcher performs a real request through the bridge. If that check fails, it stops before opening a window that cannot load account details, chats, or plugins. For a direct LAN SOCKS5 server, check ChatGPT Proxy's Local Network permission, the SOCKS5 service, and its upstream path. Ad hoc signed builds may require this permission again after an update; users migrating from older builds may also see a legacy `CodexProxyLauncher` entry.
+On macOS 15 or later, allow ChatGPT Proxy under **System Settings > Privacy & Security > Local Network** when that LAN case applies. Before opening ChatGPT, the launcher performs a real request through the bridge. While checking, the configuration window shows progress. If the check fails, the launcher presents the error in front and immediately cleans up the check process and temporary bridge. Quitting at this stage does not claim that ChatGPT is running or show the quit-both confirmation. For a direct LAN SOCKS5 server, check ChatGPT Proxy's Local Network permission, the SOCKS5 service, and its upstream path. Ad hoc signed builds may require this permission again after an update; users migrating from older builds may also see a legacy `CodexProxyLauncher` entry.
 
 ### Build
 

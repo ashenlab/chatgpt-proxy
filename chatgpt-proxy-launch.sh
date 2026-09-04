@@ -91,13 +91,13 @@ stop_bridge() {
 }
 
 cleanup_launcher() {
-  local status=$?
+  local exit_status=$?
   trap - EXIT
   stop_bridge
   /bin/rm -f "${CHATGPT_PID_FILE}"
   remove_session_state
 
-  return "${status}"
+  return "${exit_status}"
 }
 
 trap cleanup_launcher EXIT
@@ -122,7 +122,10 @@ DEFAULT_BYPASS_ITEMS=(
 )
 
 fail() {
-  /usr/bin/osascript -e "display dialog \"ChatGPT Proxy failed:\n\n$*\" buttons {\"OK\"} default button \"OK\" with icon stop" >/dev/null 2>&1 || true
+  print -r -- "$*" >&2
+  if [[ "${CHATGPT_PROXY_SKIP_UI:-0}" != "1" ]]; then
+    /usr/bin/osascript -e "display dialog \"ChatGPT Proxy failed:\n\n$*\" buttons {\"OK\"} default button \"OK\" with icon stop" >/dev/null 2>&1 || true
+  fi
   exit 1
 }
 
