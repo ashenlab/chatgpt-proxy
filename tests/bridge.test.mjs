@@ -76,10 +76,11 @@ function startBridge(bridgePort, socksPort, environment = {}) {
       ...process.env,
       BRIDGE_LISTEN_HOST: "127.0.0.1",
       BRIDGE_LISTEN_PORT: String(bridgePort),
-      UPSTREAM_SOCKS_HOST: "127.0.0.1",
-      UPSTREAM_SOCKS_PORT: String(socksPort),
-      UPSTREAM_SOCKS_USERNAME: "",
-      UPSTREAM_SOCKS_PASSWORD: "",
+      UPSTREAM_PROXY_TYPE: "socks5",
+      UPSTREAM_PROXY_HOST: "127.0.0.1",
+      UPSTREAM_PROXY_PORT: String(socksPort),
+      UPSTREAM_PROXY_USERNAME: "",
+      UPSTREAM_PROXY_PASSWORD: "",
       ...environment,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -120,6 +121,101 @@ function stopChild(child) {
   if (child.exitCode !== null) return Promise.resolve();
   child.kill("SIGTERM");
   return new Promise((resolve) => child.once("exit", resolve));
+}
+
+async function testHTTPUpstream({ username = "", password = "" } = {}) {
+  let connectAuthority = "";
+  let authorization = "";
+  const proxyServer = net.createServer((socket) => {
+    let header = Buffer.alloc(0);
+    let connected = false;
+    socket.on("data", (chunk) => {
+      if (connected) {
+        socket.write(chunk);
+        return;
+      }
+      header = Buffer.concat([header, chunk]);
+      const end = header.indexOf("\r\n\r\n");
+      if (end < 0) return;
+      const lines = header.subarray(0, end).toString("latin1").split("\r\n");
+      connectAuthority = lines[0].split(" ")[1] || "";
+      authorization = lines.find((line) => line.toLowerCase().startsWith("proxy-authorization:")) || "";
+      connected = true;
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      const remainder = header.subarray(end + 4);
+      if (remainder.length > 0) socket.write(remainder);
+    });
+  });
+  const proxyPort = await listen(proxyServer);
+  const bridgePort = await reservePort();
+  const bridge = startBridge(bridgePort, proxyPort, {
+    UPSTREAM_PROXY_TYPE: "http",
+    UPSTREAM_PROXY_USERNAME: username,
+    UPSTREAM_PROXY_PASSWORD: password,
+  });
+  try {
+    await waitForPort(bridgePort, bridge);
+    const client = net.connect({ host: "127.0.0.1", port: bridgePort });
+    await new Promise((resolve) => client.once("connect", resolve));
+    client.write("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+    const response = await readUntil(client, (data) => data.includes("\r\n\r\n"));
+    assert.match(response.toString("latin1"), /^HTTP\/1\.1 200 /);
+    assert.equal(connectAuthority, "example.com:443");
+    if (username || password) {
+      assert.equal(authorization, `Proxy-Authorization: Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`);
+    } else {
+      assert.equal(authorization, "");
+    }
+    client.write("http-upstream-ping");
+    const echoed = await readUntil(client, (data) => data.includes("http-upstream-ping"));
+    assert.equal(echoed.toString(), "http-upstream-ping");
+    client.destroy();
+  } finally {
+    await stopChild(bridge);
+    await close(proxyServer);
+  }
+}
+
+async function testHTTPForwardRequest({ username = "", password = "" } = {}) {
+  let requestLine = "";
+  let authorization = "";
+  const proxyServer = net.createServer((socket) => {
+    let request = Buffer.alloc(0);
+    socket.on("data", (chunk) => {
+      request = Buffer.concat([request, chunk]);
+      const end = request.indexOf("\r\n\r\n");
+      if (end < 0) return;
+      const lines = request.subarray(0, end).toString("latin1").split("\r\n");
+      requestLine = lines[0];
+      authorization = lines.find((line) => line.toLowerCase().startsWith("proxy-authorization:")) || "";
+      socket.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+    });
+  });
+  const proxyPort = await listen(proxyServer);
+  const bridgePort = await reservePort();
+  const bridge = startBridge(bridgePort, proxyPort, {
+    UPSTREAM_PROXY_TYPE: "http",
+    UPSTREAM_PROXY_USERNAME: username,
+    UPSTREAM_PROXY_PASSWORD: password,
+  });
+  try {
+    await waitForPort(bridgePort, bridge);
+    const client = net.connect({ host: "127.0.0.1", port: bridgePort });
+    await new Promise((resolve) => client.once("connect", resolve));
+    client.write("GET http://example.com/status HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    const response = await readUntil(client, (data) => data.includes("\r\n\r\nOK"));
+    assert.match(response.toString("latin1"), /^HTTP\/1\.1 200 OK/);
+    assert.equal(requestLine, "GET http://example.com/status HTTP/1.1");
+    if (username || password) {
+      assert.equal(authorization, `Proxy-Authorization: Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`);
+    } else {
+      assert.equal(authorization, "");
+    }
+    client.destroy();
+  } finally {
+    await stopChild(bridge);
+    await close(proxyServer);
+  }
 }
 
 async function main() {
@@ -263,6 +359,11 @@ async function main() {
   }
 
   await close(socksServer);
+
+  await testHTTPUpstream();
+  await testHTTPUpstream({ username: "proxy-user", password: "p@ss:word" });
+  await testHTTPForwardRequest();
+  await testHTTPForwardRequest({ username: "proxy-user", password: "p@ss:word" });
 
   const blocker = net.createServer();
   const blockedPort = await listen(blocker);

@@ -1,9 +1,22 @@
 import Cocoa
 import Darwin
 
+enum ProxyType: String, CaseIterable {
+    case http
+    case socks5
+
+    var displayName: String {
+        switch self {
+        case .socks5: return "SOCKS5"
+        case .http: return "HTTP"
+        }
+    }
+}
+
 struct ProxyConfig {
     var id: String
     var name: String
+    var type: ProxyType
     var host: String
     var port: String
     var username: String
@@ -23,6 +36,7 @@ struct LauncherConfig {
 struct ManagedSessionSnapshot {
     let chatGPTAppPath: String
     let proxyName: String
+    let proxyType: ProxyType
     let proxyHost: String
     let proxyPort: String
     let authenticationEnabled: Bool
@@ -138,14 +152,16 @@ final class ConfigStore {
         var proxies: [ProxyConfig] = []
         for id in ids {
             let key = id.uppercased()
+            let type = ProxyType(rawValue: parseScalar(values["PROXY_\(key)_TYPE"] ?? "\"socks5\"")) ?? .socks5
             proxies.append(ProxyConfig(
                 id: id,
                 name: parseScalar(values["PROXY_\(key)_NAME"] ?? "\"\(id)\""),
+                type: type,
                 host: parseScalar(values["PROXY_\(key)_HOST"] ?? "\"\""),
                 port: parseScalar(values["PROXY_\(key)_PORT"] ?? "\"1080\""),
                 username: parseScalar(values["PROXY_\(key)_USERNAME"] ?? "\"\""),
                 password: parseScalar(values["PROXY_\(key)_PASSWORD"] ?? "\"\""),
-                bridge: parseScalar(values["PROXY_\(key)_HTTP_BRIDGE"] ?? "\"0\"") == "1"
+                bridge: type == .socks5 && parseScalar(values["PROXY_\(key)_HTTP_BRIDGE"] ?? "\"0\"") == "1"
             ))
         }
 
@@ -175,19 +191,20 @@ final class ConfigStore {
         lines.append("# ChatGPT application bundle. Paths containing spaces are supported.")
         lines.append("CHATGPT_APP_PATH=\(quote(config.chatGPTAppPath))")
         lines.append("")
-        lines.append("# Configured SOCKS5 proxies.")
+        lines.append("# Configured SOCKS5 or HTTP CONNECT proxies.")
         lines.append("PROXY_IDS=(\(proxyIDs))")
         for proxy in config.proxies {
             let key = proxy.id.uppercased()
             lines.append("PROXY_\(key)_NAME=\(quote(proxy.name))")
+            lines.append("PROXY_\(key)_TYPE=\(quote(proxy.type.rawValue))")
             lines.append("PROXY_\(key)_HOST=\(quote(proxy.host))")
             lines.append("PROXY_\(key)_PORT=\(quote(proxy.port))")
             lines.append("PROXY_\(key)_USERNAME=\(quote(proxy.username))")
             lines.append("PROXY_\(key)_PASSWORD=\(quote(proxy.password))")
-            lines.append("PROXY_\(key)_HTTP_BRIDGE=\(quote(proxy.bridge ? "1" : "0"))")
+            lines.append("PROXY_\(key)_HTTP_BRIDGE=\(quote(proxy.type == .socks5 && proxy.bridge ? "1" : "0"))")
             lines.append("")
         }
-        lines.append("# Local HTTP CONNECT bridge used when a proxy enables HTTP bridge mode.")
+        lines.append("# Local HTTP CONNECT bridge used only by SOCKS5 profiles.")
         lines.append("HTTP_BRIDGE_HOST=\(quote(config.httpBridgeHost))")
         lines.append("HTTP_BRIDGE_PORT=\(quote(config.httpBridgePort))")
         lines.append("")
@@ -202,8 +219,8 @@ final class ConfigStore {
         LauncherConfig(
             activeProxy: "local",
             proxies: [
-                ProxyConfig(id: "local", name: "Local SOCKS", host: "127.0.0.1", port: "1080", username: "", password: "", bridge: true),
-                ProxyConfig(id: "remote", name: "Remote SOCKS", host: "proxy.example.com", port: "1080", username: "", password: "", bridge: true)
+                ProxyConfig(id: "local", name: "Local SOCKS", type: .socks5, host: "127.0.0.1", port: "1080", username: "", password: "", bridge: true),
+                ProxyConfig(id: "remote", name: "Remote HTTP", type: .http, host: "proxy.example.com", port: "8080", username: "", password: "", bridge: false)
             ],
             bypassItems: defaultBypassItems()
         )
@@ -325,6 +342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     private let proxyTable = NSTableView()
     private let bypassTable = NSTableView()
     private let nameField = NSTextField()
+    private let proxyTypeMenu = NSPopUpButton()
     private let hostField = NSTextField()
     private let portField = NSTextField()
     private let usernameField = NSTextField()
@@ -345,8 +363,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     private let proxyTabItem = NSTabViewItem(identifier: "proxies")
     private let bypassTabItem = NSTabViewItem(identifier: "bypass")
     private let setCurrentButton = NSButton()
+    private let moveProxyUpButton = NSButton()
+    private let moveProxyDownButton = NSButton()
     private let proxyDetailsLabel = NSTextField(labelWithString: "")
     private let nameLabel = NSTextField(labelWithString: "")
+    private let proxyTypeLabel = NSTextField(labelWithString: "")
     private let hostLabel = NSTextField(labelWithString: "")
     private let portLabel = NSTextField(labelWithString: "")
     private let usernameLabel = NSTextField(labelWithString: "")
@@ -363,7 +384,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     private let statusLabel = NSTextField(labelWithString: "")
     private var usernameRow: NSGridRow?
     private var passwordRow: NSGridRow?
+    private var bridgeHostRow: NSGridRow?
+    private var bridgePortRow: NSGridRow?
+    private var bridgeToggleRow: NSGridRow?
     private var launchProcess: Process?
+    private var proxyPreflightProcess: Process?
+    private var directHTTPPreflightVerified = false
     private var managedSessionSnapshot: ManagedSessionSnapshot?
     private var managedChatGPTPID: Int32?
     private var launchAttemptID: UUID?
@@ -393,6 +419,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         dismissStatusWindow()
+        if let proxyPreflightProcess, proxyPreflightProcess.isRunning {
+            proxyPreflightProcess.terminate()
+            self.proxyPreflightProcess = nil
+        }
         guard let activeLaunchProcess = launchProcess, activeLaunchProcess.isRunning else {
             enableAutomaticTerminationIfNeeded()
             return .terminateNow
@@ -482,10 +512,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "proxies": "Proxies",
             "bypass": "Bypass",
             "setCurrent": "Set Current",
+            "moveUp": "Move Up",
+            "moveDown": "Move Down",
             "proxyDetails": "Proxy Details",
             "name": "Name",
-            "socksHost": "SOCKS Host",
-            "socksPort": "SOCKS Port",
+            "proxyType": "Proxy Type",
+            "proxyHost": "Proxy Host",
+            "proxyPort": "Proxy Port",
             "username": "Username",
             "password": "Password",
             "useAuth": "Use authentication",
@@ -493,7 +526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "bridgePort": "Bridge Port",
             "useBridge": "Use local HTTP bridge",
             "bridgeHelpTitle": "What is the HTTP bridge?",
-            "bridgeHelp": "Some internal clients may not handle SOCKS5 proxy settings reliably. The local HTTP bridge exposes an HTTP CONNECT proxy on 127.0.0.1, then forwards traffic to the selected SOCKS5 proxy.\n\nEnable it if login works but chats, app-server requests, or the plugin marketplace time out or load partially.",
+            "bridgeHelp": "The local bridge exposes an HTTP CONNECT proxy on 127.0.0.1 and forwards it to the selected SOCKS5 proxy. HTTP profiles always connect directly and do not use these settings.",
             "add": "Add",
             "remove": "Remove",
             "resetDefaults": "Reset Defaults",
@@ -504,6 +537,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "none": "None",
             "saved": "Saved.",
             "checkingProxy": "Checking proxy connection…",
+            "httpPreflightFailed": "HTTP proxy check failed",
+            "httpPreflightFailedInfo": "The HTTP proxy could not complete a real HTTPS CONNECT request. Check its address, authentication, and upstream connection.",
             "addBypassTitle": "Add Bypass",
             "addBypassInfo": "Enter a host, domain, wildcard domain, IP, or CIDR.",
             "proxyNameRequired": "Proxy name is required",
@@ -511,9 +546,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "proxyNamesUnique": "Proxy names must be unique",
             "proxyNamesUniqueInfo": "Rename the duplicate proxy before launching.",
             "proxyHostRequired": "Proxy host is required",
-            "proxyHostRequiredInfo": "%@ needs a SOCKS host.",
+            "proxyHostRequiredInfo": "%@ needs a proxy host.",
             "proxyPortInvalid": "Proxy port is invalid",
-            "proxyPortInvalidInfo": "%@ needs a SOCKS port from 1 to 65535.",
+            "proxyPortInvalidInfo": "%@ needs a proxy port from 1 to 65535.",
             "bridgeHostInvalid": "Bridge host is invalid",
             "bridgeHostInvalidInfo": "Use a loopback host: 127.0.0.1, localhost, or ::1.",
             "bridgePortInvalid": "Bridge port is invalid",
@@ -550,10 +585,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "proxies": "代理",
             "bypass": "直连排除",
             "setCurrent": "设为当前",
+            "moveUp": "上移",
+            "moveDown": "下移",
             "proxyDetails": "代理详情",
             "name": "名称",
-            "socksHost": "SOCKS 主机",
-            "socksPort": "SOCKS 端口",
+            "proxyType": "代理类型",
+            "proxyHost": "代理主机",
+            "proxyPort": "代理端口",
             "username": "用户名",
             "password": "密码",
             "useAuth": "需要认证",
@@ -561,7 +599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "bridgePort": "Bridge 端口",
             "useBridge": "启用本地 HTTP bridge",
             "bridgeHelpTitle": "HTTP bridge 是什么？",
-            "bridgeHelp": "有些内部 HTTP 客户端对 SOCKS5 代理支持不够稳定。本地 HTTP bridge 会在 127.0.0.1 提供一个 HTTP CONNECT 代理，再转发到你选择的 SOCKS5 代理。\n\n如果登录正常，但对话、app-server 请求或插件市场超时/加载不完整，可以开启它。",
+            "bridgeHelp": "本地 bridge 会在 127.0.0.1 提供 HTTP CONNECT 代理，再转发到所选 SOCKS5 代理。HTTP 配置始终直接连接，不使用这些设置。",
             "add": "添加",
             "remove": "删除",
             "resetDefaults": "恢复默认",
@@ -572,6 +610,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "none": "无",
             "saved": "已保存。",
             "checkingProxy": "正在检查代理连接…",
+            "httpPreflightFailed": "HTTP 代理检查失败",
+            "httpPreflightFailedInfo": "HTTP 代理未能完成真实的 HTTPS CONNECT 请求。请检查代理地址、认证信息和上游连接。",
             "addBypassTitle": "添加直连排除",
             "addBypassInfo": "输入主机名、域名、通配域名、IP 或 CIDR。",
             "proxyNameRequired": "代理名称不能为空",
@@ -579,9 +619,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "proxyNamesUnique": "代理名称不能重复",
             "proxyNamesUniqueInfo": "请先重命名重复的代理。",
             "proxyHostRequired": "代理主机不能为空",
-            "proxyHostRequiredInfo": "%@ 需要 SOCKS 主机地址。",
+            "proxyHostRequiredInfo": "%@ 需要代理主机地址。",
             "proxyPortInvalid": "代理端口无效",
-            "proxyPortInvalidInfo": "%@ 需要 1 到 65535 之间的 SOCKS 端口。",
+            "proxyPortInvalidInfo": "%@ 需要 1 到 65535 之间的代理端口。",
             "bridgeHostInvalid": "Bridge 主机无效",
             "bridgeHostInvalidInfo": "请使用回环主机：127.0.0.1、localhost 或 ::1。",
             "bridgePortInvalid": "Bridge 端口无效",
@@ -626,10 +666,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         proxyTabItem.label = tr("proxies")
         bypassTabItem.label = tr("bypass")
         setCurrentButton.title = tr("setCurrent")
+        moveProxyUpButton.toolTip = tr("moveUp")
+        moveProxyDownButton.toolTip = tr("moveDown")
         proxyDetailsLabel.stringValue = tr("proxyDetails")
         nameLabel.stringValue = tr("name")
-        hostLabel.stringValue = tr("socksHost")
-        portLabel.stringValue = tr("socksPort")
+        proxyTypeLabel.stringValue = tr("proxyType")
+        hostLabel.stringValue = tr("proxyHost")
+        portLabel.stringValue = tr("proxyPort")
         usernameLabel.stringValue = tr("username")
         passwordLabel.stringValue = tr("password")
         authCheck.title = tr("useAuth")
@@ -762,6 +805,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         proxyButtons.spacing = 8
         proxyButtons.addArrangedSubview(NSButton(title: "+", target: self, action: #selector(addProxy)))
         proxyButtons.addArrangedSubview(NSButton(title: "-", target: self, action: #selector(removeProxy)))
+        moveProxyUpButton.title = "↑"
+        moveProxyUpButton.target = self
+        moveProxyUpButton.action = #selector(moveProxyUp)
+        proxyButtons.addArrangedSubview(moveProxyUpButton)
+        moveProxyDownButton.title = "↓"
+        moveProxyDownButton.target = self
+        moveProxyDownButton.action = #selector(moveProxyDown)
+        proxyButtons.addArrangedSubview(moveProxyDownButton)
         setCurrentButton.target = self
         setCurrentButton.action = #selector(setCurrentProxy)
         proxyButtons.addArrangedSubview(setCurrentButton)
@@ -786,6 +837,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
 
         let form = NSGridView(views: [
             [nameLabel, nameField],
+            [proxyTypeLabel, proxyTypeMenu],
             [hostLabel, hostField],
             [portLabel, portField],
             [NSView(), authCheck],
@@ -795,12 +847,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             [bridgePortLabel, bridgePortField],
             [NSView(), bridgeRow]
         ])
-        usernameRow = form.row(at: 4)
-        passwordRow = form.row(at: 5)
-        for field in [nameLabel, hostLabel, portLabel, usernameLabel, passwordLabel, bridgeHostLabel, bridgePortLabel] {
+        usernameRow = form.row(at: 5)
+        passwordRow = form.row(at: 6)
+        bridgeHostRow = form.row(at: 7)
+        bridgePortRow = form.row(at: 8)
+        bridgeToggleRow = form.row(at: 9)
+        for field in [nameLabel, proxyTypeLabel, hostLabel, portLabel, usernameLabel, passwordLabel, bridgeHostLabel, bridgePortLabel] {
             field.textColor = .secondaryLabelColor
         }
         form.column(at: 0).xPlacement = .trailing
+        form.column(at: 0).width = 90
         form.column(at: 1).width = 330
         form.rowSpacing = 10
         form.columnSpacing = 10
@@ -810,9 +866,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         }
         authCheck.target = self
         authCheck.action = #selector(authToggled)
+        proxyTypeMenu.addItems(withTitles: ProxyType.allCases.map(\.displayName))
+        proxyTypeMenu.target = self
+        proxyTypeMenu.action = #selector(proxyTypeChanged)
         bridgeCheck.target = self
         bridgeCheck.action = #selector(fieldsChanged)
         updateAuthRows()
+        updateBridgeRows(for: .http)
 
         let right = NSStackView()
         right.orientation = .vertical
@@ -879,6 +939,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         }
         loadSelectedProxy()
         updateCurrentLabel()
+        updateProxyMoveButtons()
     }
 
     private func updateCurrentLabel() {
@@ -892,6 +953,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         let proxy = config.proxies[row]
         editingProxyID = proxy.id
         nameField.stringValue = proxy.name
+        proxyTypeMenu.selectItem(withTitle: proxy.type.displayName)
         hostField.stringValue = proxy.host
         portField.stringValue = proxy.port
         usernameField.stringValue = proxy.username
@@ -901,6 +963,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         bridgeCheck.state = proxy.bridge ? .on : .off
         bridgeHostField.stringValue = config.httpBridgeHost
         bridgePortField.stringValue = config.httpBridgePort
+        updateBridgeRows(for: proxy.type)
+        updateProxyMoveButtons()
     }
 
     private func saveFieldsToSelectedProxy() {
@@ -917,6 +981,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         let row = proxyTable.selectedRow
         guard let index = config.proxies.firstIndex(where: { $0.id == proxyID }) else { return }
         config.proxies[index].name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedTypeIndex = proxyTypeMenu.indexOfSelectedItem
+        config.proxies[index].type = ProxyType.allCases.indices.contains(selectedTypeIndex)
+            ? ProxyType.allCases[selectedTypeIndex]
+            : .http
         config.proxies[index].host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         config.proxies[index].port = portField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if authCheck.state == .on {
@@ -926,7 +994,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             config.proxies[index].username = ""
             config.proxies[index].password = ""
         }
-        config.proxies[index].bridge = bridgeCheck.state == .on
+        config.proxies[index].bridge = config.proxies[index].type == .socks5 && bridgeCheck.state == .on
         config.httpBridgeHost = bridgeHostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         config.httpBridgePort = bridgePortField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         proxyTable.reloadData()
@@ -941,6 +1009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             saveFields(to: editingProxyID)
         }
         loadSelectedProxy()
+        updateProxyMoveButtons()
     }
 
     @objc private func languageChanged() {
@@ -963,12 +1032,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         passwordRow?.isHidden = !visible
     }
 
+    private func updateBridgeRows(for type: ProxyType) {
+        let visible = type == .socks5
+        bridgeHostRow?.isHidden = !visible
+        bridgePortRow?.isHidden = !visible
+        bridgeToggleRow?.isHidden = !visible
+        bridgeCheck.isEnabled = visible
+    }
+
     @objc private func authToggled() {
         if authCheck.state != .on {
             usernameField.stringValue = ""
             passwordField.stringValue = ""
         }
         updateAuthRows()
+        fieldsChanged()
+    }
+
+    @objc private func proxyTypeChanged() {
+        let selectedTypeIndex = proxyTypeMenu.indexOfSelectedItem
+        let type = ProxyType.allCases.indices.contains(selectedTypeIndex)
+            ? ProxyType.allCases[selectedTypeIndex]
+            : .http
+        if type == .http {
+            bridgeCheck.state = .off
+        } else {
+            bridgeCheck.state = .on
+        }
+        updateBridgeRows(for: type)
         fieldsChanged()
     }
 
@@ -981,7 +1072,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         saveFieldsToSelectedProxy()
         let baseName = uniqueProxyName("New Proxy")
         let id = store.generatedID(for: baseName, existing: config.proxies)
-        config.proxies.append(ProxyConfig(id: id, name: baseName, host: "127.0.0.1", port: "1080", username: "", password: "", bridge: true))
+        config.proxies.append(ProxyConfig(id: id, name: baseName, type: .http, host: "127.0.0.1", port: "8080", username: "", password: "", bridge: false))
         config.activeProxy = id
         reloadAll()
         clearStatus()
@@ -1006,6 +1097,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         config.activeProxy = config.proxies[row].id
         updateCurrentLabel()
         clearStatus()
+    }
+
+    @objc private func moveProxyUp() {
+        moveSelectedProxy(by: -1)
+    }
+
+    @objc private func moveProxyDown() {
+        moveSelectedProxy(by: 1)
+    }
+
+    private func moveSelectedProxy(by offset: Int) {
+        saveFieldsToSelectedProxy()
+        let row = proxyTable.selectedRow
+        let destination = row + offset
+        guard row >= 0, row < config.proxies.count,
+              destination >= 0, destination < config.proxies.count else { return }
+        config.proxies.swapAt(row, destination)
+        proxyTable.reloadData()
+        proxyTable.selectRowIndexes(IndexSet(integer: destination), byExtendingSelection: false)
+        loadSelectedProxy()
+        clearStatus()
+    }
+
+    private func updateProxyMoveButtons() {
+        let row = proxyTable.selectedRow
+        moveProxyUpButton.isEnabled = row > 0 && row < config.proxies.count
+        moveProxyDownButton.isEnabled = row >= 0 && row < config.proxies.count - 1
     }
 
     @objc private func addBypass() {
@@ -1183,6 +1301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             ManagedSessionSnapshot(
                 chatGPTAppPath: config.chatGPTAppPath,
                 proxyName: $0.name,
+                proxyType: $0.type,
                 proxyHost: $0.host,
                 proxyPort: $0.port,
                 authenticationEnabled: !$0.username.isEmpty || !$0.password.isEmpty,
@@ -1246,11 +1365,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
 
         let snapshot = input.sessionSnapshot
         let proxyName = snapshot?.proxyName ?? (chinese ? "无" : "None")
-        let socksEndpoint = snapshot.map { "\($0.proxyHost):\($0.proxyPort)" } ?? (chinese ? "无" : "None")
+        let proxyTypeName = snapshot?.proxyType.displayName ?? (chinese ? "无" : "None")
+        let proxyEndpoint = snapshot.map { "\($0.proxyHost):\($0.proxyPort)" } ?? (chinese ? "无" : "None")
         let bridgeEnabled = snapshot?.bridgeEnabled == true
         let authentication: String
         if snapshot?.authenticationEnabled == true {
-            if bridgeEnabled {
+            if snapshot?.proxyType == .http {
+                authentication = chinese
+                    ? "已配置（凭据不显示；内部客户端通过代理 URL 使用，Chromium 可能自行请求认证）"
+                    : "Configured (credentials hidden; internal clients use the proxy URL, while Chromium may request authentication itself)"
+            } else if bridgeEnabled {
                 authentication = chinese
                     ? "已配置（凭据不显示；仅供本地 HTTP bridge 使用）"
                     : "Configured (credentials hidden; used only by the local HTTP bridge)"
@@ -1266,9 +1390,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         let environmentProxy = snapshot.map {
             $0.bridgeEnabled
                 ? "http://\(urlHost($0.bridgeHost)):\($0.bridgePort)"
-                : "socks5h://\(urlHost($0.proxyHost)):\($0.proxyPort)"
+                : ($0.proxyType == .http
+                    ? "http://\(urlHost($0.proxyHost)):\($0.proxyPort)"
+                    : "socks5h://\(urlHost($0.proxyHost)):\($0.proxyPort)")
         } ?? (chinese ? "无" : "None")
-        let chromiumProxy = snapshot.map { "socks5://\(urlHost($0.proxyHost)):\($0.proxyPort)" } ?? (chinese ? "无" : "None")
+        let chromiumProxy = snapshot.map {
+            if $0.proxyType == .http {
+                return $0.bridgeEnabled
+                    ? "http://\(urlHost($0.bridgeHost)):\($0.bridgePort)"
+                    : "http://\(urlHost($0.proxyHost)):\($0.proxyPort)"
+            }
+            return "socks5://\(urlHost($0.proxyHost)):\($0.proxyPort)"
+        } ?? (chinese ? "无" : "None")
         let bypass = snapshot?.bypassItems.joined(separator: ", ") ?? (chinese ? "无" : "None")
         let listener = bridgeListenerStatus(input: input, processes: processes)
         let sessionRecord = sessionRecordStatus(input: input, processes: processes)
@@ -1289,11 +1422,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
 
             \(proxySectionTitle)
             配置名称：\(proxyName)
-            上游 SOCKS5：\(socksEndpoint)
-            SOCKS5 认证：\(authentication)
+            代理类型：\(proxyTypeName)
+            上游代理：\(proxyEndpoint)
+            代理认证：\(authentication)
             Chromium --proxy-server：\(chromiumProxy)
             HTTP_PROXY / HTTPS_PROXY / ALL_PROXY：\(environmentProxy)
-            本地 HTTP bridge：\(bridgeEnabled ? "已启用（\(bridgeEndpoint)）" : "未启用")
+            本地 HTTP bridge：\(snapshot?.proxyType == .http ? "不使用（HTTP 直连）" : (bridgeEnabled ? "已启用（\(bridgeEndpoint)）" : "未启用"))
             直连排除：\(bypass)
 
             【本地监听状态】
@@ -1335,11 +1469,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
 
         \(proxySectionTitle)
         Profile: \(proxyName)
-        Upstream SOCKS5: \(socksEndpoint)
-        SOCKS5 authentication: \(authentication)
+        Proxy type: \(proxyTypeName)
+        Upstream proxy: \(proxyEndpoint)
+        Proxy authentication: \(authentication)
         Chromium --proxy-server: \(chromiumProxy)
         HTTP_PROXY / HTTPS_PROXY / ALL_PROXY: \(environmentProxy)
-        Local HTTP bridge: \(bridgeEnabled ? "Enabled (\(bridgeEndpoint))" : "Disabled")
+        Local HTTP bridge: \(snapshot?.proxyType == .http ? "Not used (direct HTTP)" : (bridgeEnabled ? "Enabled (\(bridgeEndpoint))" : "Disabled"))
         Direct-connect bypasses: \(bypass)
 
         [Local listener status]
@@ -1379,6 +1514,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         processes: [(pid: Int32, ppid: Int32, command: String)]
     ) -> String {
         let chinese = input.chinese
+        if input.sessionSnapshot?.proxyType == .http {
+            return chinese
+                ? "正常：HTTP 模式直接连接上游代理，不使用本地 bridge 监听。"
+                : "Normal: HTTP mode connects directly to the upstream proxy and does not use a local bridge listener."
+        }
         let port = input.sessionSnapshot?.bridgePort ?? input.configuredBridgePort
         let host = input.sessionSnapshot?.bridgeHost ?? input.configuredBridgeHost
         guard Int(port) != nil else {
@@ -1596,6 +1736,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     }
 
     @objc private func launchClicked() {
+        directHTTPPreflightVerified = false
         saveFieldsToSelectedProxy()
         guard validateConfig() else { return }
         do {
@@ -1606,31 +1747,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
                 suppressTerminationForRelaunch = false
                 return
             }
-            if !handleRunningChatGPTIfNeeded() {
-                suppressTerminationForRelaunch = false
+            if let proxy = config.proxies.first(where: { $0.id == config.activeProxy }),
+               proxy.type == .http {
+                try beginDirectHTTPPreflight(proxy: proxy, replacingManagedSession: replacingManagedSession)
+            } else {
+                continueLaunch(replacingManagedSession: replacingManagedSession)
+            }
+        } catch {
+            suppressTerminationForRelaunch = false
+            launchButton.isEnabled = true
+            showError(tr("unableLaunch"), error.localizedDescription)
+        }
+    }
+
+    private func beginDirectHTTPPreflight(proxy: ProxyConfig, replacingManagedSession: Bool) throws {
+        guard let proxyURL = directHTTPProxyURL(proxy) else {
+            throw NSError(domain: "ChatGPTProxyLauncher", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: tr("httpPreflightFailedInfo")
+            ])
+        }
+        let process = Process()
+        let errorPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = [
+            "--silent", "--show-error", "--output", "/dev/null",
+            "--connect-timeout", "8", "--max-time", "15", "--noproxy", "",
+            "https://api.openai.com/"
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+            environment[name] = proxyURL
+        }
+        environment["NO_PROXY"] = ""
+        environment["no_proxy"] = ""
+        process.environment = environment
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errorPipe
+        process.terminationHandler = { [weak self] terminatedProcess in
+            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let errorText = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async {
+                guard let self, self.proxyPreflightProcess === terminatedProcess else { return }
+                self.proxyPreflightProcess = nil
+                if terminatedProcess.terminationStatus == 0 {
+                    self.directHTTPPreflightVerified = true
+                    self.continueLaunch(replacingManagedSession: replacingManagedSession)
+                } else {
+                    self.suppressTerminationForRelaunch = false
+                    self.launchButton.isEnabled = true
+                    self.statusLabel.stringValue = ""
+                    let details = errorText?.isEmpty == false
+                        ? "\(self.tr("httpPreflightFailedInfo"))\n\n\(errorText!)"
+                        : self.tr("httpPreflightFailedInfo")
+                    self.showError(self.tr("httpPreflightFailed"), details)
+                }
+            }
+        }
+        proxyPreflightProcess = process
+        launchButton.isEnabled = false
+        statusLabel.stringValue = tr("checkingProxy")
+        do {
+            try process.run()
+        } catch {
+            proxyPreflightProcess = nil
+            launchButton.isEnabled = true
+            statusLabel.stringValue = ""
+            throw error
+        }
+    }
+
+    private func directHTTPProxyURL(_ proxy: ProxyConfig) -> String? {
+        var components = URLComponents()
+        components.scheme = "http"
+        var host = proxy.host
+        if host.hasPrefix("["), host.hasSuffix("]") {
+            host.removeFirst()
+            host.removeLast()
+        }
+        components.host = host
+        components.port = Int(proxy.port)
+        if !proxy.username.isEmpty || !proxy.password.isEmpty {
+            components.user = proxy.username
+            components.password = proxy.password
+        }
+        return components.url?.absoluteString
+    }
+
+    private func continueLaunch(replacingManagedSession: Bool) {
+        if !handleRunningChatGPTIfNeeded() {
+            suppressTerminationForRelaunch = false
+            launchButton.isEnabled = true
+            statusLabel.stringValue = ""
+            return
+        }
+        if replacingManagedSession {
+            let deadline = Date().addingTimeInterval(6)
+            while launchProcess != nil, Date() < deadline {
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+            }
+            suppressTerminationForRelaunch = false
+            guard launchProcess == nil else {
+                launchButton.isEnabled = true
+                statusLabel.stringValue = ""
+                showError(tr("unableLaunch"), tr("cleanupFailed"))
                 return
             }
-            if replacingManagedSession {
-                let deadline = Date().addingTimeInterval(6)
-                while launchProcess != nil, Date() < deadline {
-                    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
-                }
-                suppressTerminationForRelaunch = false
-                guard launchProcess == nil else {
-                    showError(tr("unableLaunch"), tr("cleanupFailed"))
-                    return
-                }
-            }
-            if replacingManagedSession, !resolveBridgePortConflictIfNeeded() {
-                suppressTerminationForRelaunch = false
-                return
-            }
+        }
+        if replacingManagedSession, !resolveBridgePortConflictIfNeeded() {
+            suppressTerminationForRelaunch = false
+            launchButton.isEnabled = true
+            statusLabel.stringValue = ""
+            return
+        }
+        do {
             try launchChatGPT(waitForBridgeRelease: replacingManagedSession)
             launchButton.isEnabled = false
             statusLabel.stringValue = tr("checkingProxy")
         } catch {
             suppressTerminationForRelaunch = false
             launchButton.isEnabled = true
+            statusLabel.stringValue = ""
             showError(tr("unableLaunch"), error.localizedDescription)
         }
     }
@@ -1819,6 +2056,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         var env = ProcessInfo.processInfo.environment
         env["CHATGPT_PROXY_SKIP_UI"] = "1"
         env["CHATGPT_PROXY_WAIT_FOR_BRIDGE_RELEASE"] = waitForBridgeRelease ? "1" : "0"
+        env["CHATGPT_PROXY_PREFLIGHT_VERIFIED"] = directHTTPPreflightVerified ? "1" : "0"
         process.environment = env
         process.standardError = errorPipe
         process.terminationHandler = { [weak self] terminatedProcess in
@@ -1859,12 +2097,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             throw error
         }
         launchProcess = process
+        directHTTPPreflightVerified = false
         launchAttemptID = attemptID
         managedChatGPTPID = nil
         if let proxy = config.proxies.first(where: { $0.id == config.activeProxy }) {
             managedSessionSnapshot = ManagedSessionSnapshot(
                 chatGPTAppPath: config.chatGPTAppPath,
                 proxyName: proxy.name,
+                proxyType: proxy.type,
                 proxyHost: proxy.host,
                 proxyPort: proxy.port,
                 authenticationEnabled: !proxy.username.isEmpty || !proxy.password.isEmpty,
@@ -2013,9 +2253,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         if tableView == proxyTable {
             let proxy = config.proxies[row]
             let marker = proxy.id == config.activeProxy ? "● " : "  "
-            let bridge = proxy.bridge ? "bridge" : "socks"
+            let bridge = proxy.bridge ? " bridge" : ""
             let auth = proxy.username.isEmpty && proxy.password.isEmpty ? "" : " auth"
-            textField.stringValue = "\(marker)\(proxy.name)   \(proxy.host):\(proxy.port)   \(bridge)\(auth)"
+            textField.stringValue = "\(marker)\(proxy.name)   \(proxy.type.displayName) \(proxy.host):\(proxy.port)\(bridge)\(auth)"
         } else {
             textField.stringValue = config.bypassItems[row]
         }

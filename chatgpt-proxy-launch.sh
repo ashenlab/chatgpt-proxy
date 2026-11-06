@@ -11,8 +11,10 @@ DEBUG_LOG_FILE="${SUPPORT_DIR}/chatgpt-proxy-debug.log"
 DEBUG_FLAG_FILE="${SUPPORT_DIR}/diagnostics.enabled"
 SESSION_STATE_FILE="${SUPPORT_DIR}/managed-session.state"
 SESSION_STARTED_AT="$(/bin/date +%s)"
+LAUNCHER_PID="${PPID}"
 BRIDGE_PID=""
 LAUNCH_HELPER_PID=""
+WATCHDOG_PID=""
 CHATGPT_PID_FILE="${SUPPORT_DIR}/chatgpt-pid.$$"
 /bin/mkdir -p "${SUPPORT_DIR}"
 /bin/chmod 700 "${SUPPORT_DIR}" >/dev/null 2>&1 || true
@@ -51,7 +53,7 @@ write_session_state() {
     umask 077
     print -r -- "version=1"
     print -r -- "started_at=${SESSION_STARTED_AT}"
-    print -r -- "launcher_pid=${PPID}"
+    print -r -- "launcher_pid=${LAUNCHER_PID}"
     print -r -- "script_pid=$$"
     print -r -- "bridge_pid=${BRIDGE_PID:-}"
     print -r -- "chatgpt_pid=${CHATGPT_MAIN_PID:-}"
@@ -93,6 +95,11 @@ stop_bridge() {
 cleanup_launcher() {
   local exit_status=$?
   trap - EXIT
+  if [[ -n "${WATCHDOG_PID}" ]]; then
+    /bin/kill -TERM "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+    wait "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+    WATCHDOG_PID=""
+  fi
   stop_bridge
   /bin/rm -f "${CHATGPT_PID_FILE}"
   remove_session_state
@@ -103,6 +110,14 @@ cleanup_launcher() {
 trap cleanup_launcher EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+abort_if_launcher_gone() {
+  [[ "${CHATGPT_PROXY_SKIP_UI:-0}" == "1" ]] || return 0
+  if ! /bin/kill -0 "${LAUNCHER_PID}" >/dev/null 2>&1; then
+    log_debug "launcher ${LAUNCHER_PID} is no longer running"
+    exit 143
+  fi
+}
 
 redact_proxy_url() {
   print -r -- "$1" | /usr/bin/sed -E 's#(socks5h?://)[^/@]+@#\1***@#; s#(https?://)[^/@]+@#\1***@#'
@@ -240,6 +255,16 @@ proxy_name() {
   print -r -- "${(P)var}"
 }
 
+proxy_type() {
+  local var="PROXY_$(proxy_key "$1")_TYPE"
+  local value="${(P)var:-socks5}"
+  value="${value:l}"
+  case "${value}" in
+    socks5|http) print -r -- "${value}" ;;
+    *) print -r -- "socks5" ;;
+  esac
+}
+
 proxy_host() {
   local var="PROXY_$(proxy_key "$1")_HOST"
   print -r -- "${(P)var}"
@@ -296,7 +321,7 @@ proxy_userinfo() {
 
 proxy_label() {
   local id="$1"
-  print -r -- "$(proxy_name "${id}") ($(proxy_host "${id}"):$(proxy_port "${id}"))"
+  print -r -- "$(proxy_name "${id}") ($(proxy_type "${id}") $(proxy_host "${id}"):$(proxy_port "${id}"))"
 }
 
 proxy_exists() {
@@ -352,17 +377,19 @@ ensure_proxy_config() {
   if ! typeset -p PROXY_IDS >/dev/null 2>&1; then
     PROXY_IDS=(local remote)
     PROXY_LOCAL_NAME="Local SOCKS"
+    PROXY_LOCAL_TYPE="socks5"
     PROXY_LOCAL_HOST="${LOCAL_PROXY_HOST:-127.0.0.1}"
     PROXY_LOCAL_PORT="${LOCAL_PROXY_PORT:-1080}"
     PROXY_LOCAL_USERNAME=""
     PROXY_LOCAL_PASSWORD=""
     PROXY_LOCAL_HTTP_BRIDGE="1"
-    PROXY_REMOTE_NAME="Remote SOCKS"
+    PROXY_REMOTE_NAME="Remote HTTP"
+    PROXY_REMOTE_TYPE="http"
     PROXY_REMOTE_HOST="${REMOTE_PROXY_HOST:-proxy.example.com}"
-    PROXY_REMOTE_PORT="${REMOTE_PROXY_PORT:-1080}"
+    PROXY_REMOTE_PORT="${REMOTE_PROXY_PORT:-8080}"
     PROXY_REMOTE_USERNAME=""
     PROXY_REMOTE_PASSWORD=""
-    PROXY_REMOTE_HTTP_BRIDGE="1"
+    PROXY_REMOTE_HTTP_BRIDGE="0"
   fi
 
   if (( ${#PROXY_IDS[@]} == 0 )); then
@@ -388,12 +415,14 @@ save_config() {
     print -r -- '# Active proxy id. Edit through ChatGPT Proxy, or update this file manually.'
     print -r -- "ACTIVE_PROXY=$(config_quote "${ACTIVE_PROXY}")"
     print -r -- ''
-    print -r -- '# Configured SOCKS5 proxies.'
+    print -r -- '# Configured SOCKS5 or HTTP CONNECT proxies.'
     print -r -- "PROXY_IDS=(${PROXY_IDS[@]})"
     for id in "${PROXY_IDS[@]}"; do
       key="$(proxy_key "${id}")"
       value="$(proxy_name "${id}")"
       print -r -- "PROXY_${key}_NAME=$(config_quote "${value}")"
+      value="$(proxy_type "${id}")"
+      print -r -- "PROXY_${key}_TYPE=$(config_quote "${value}")"
       value="$(proxy_host "${id}")"
       print -r -- "PROXY_${key}_HOST=$(config_quote "${value}")"
       value="$(proxy_port "${id}")"
@@ -402,12 +431,16 @@ save_config() {
       print -r -- "PROXY_${key}_USERNAME=$(config_quote "${value}")"
       value="$(proxy_password "${id}")"
       print -r -- "PROXY_${key}_PASSWORD=$(config_quote "${value}")"
-      value="$(proxy_bridge "${id}")"
+      if [[ "$(proxy_type "${id}")" == "http" ]]; then
+        value="0"
+      else
+        value="$(proxy_bridge "${id}")"
+      fi
       print -r -- "PROXY_${key}_HTTP_BRIDGE=$(config_quote "${value}")"
       print -r -- ''
     done
 
-    print -r -- '# Local HTTP CONNECT bridge used when a proxy enables HTTP bridge mode.'
+    print -r -- '# Local HTTP CONNECT bridge used only by SOCKS5 profiles.'
     print -r -- "HTTP_BRIDGE_HOST=$(config_quote "${HTTP_BRIDGE_HOST:-127.0.0.1}")"
     print -r -- "HTTP_BRIDGE_PORT=$(config_quote "${HTTP_BRIDGE_PORT:-23001}")"
     print -r -- ''
@@ -479,7 +512,7 @@ OSA
 }
 
 add_proxy() {
-  local id name host port username password bridge_button key
+  local id name type type_label host port username password bridge_button key default_port
 
   name="$(prompt_text "Add Proxy" "Proxy name. Names must be unique." "")" || return 0
   if [[ -z "${name}" ]]; then
@@ -489,25 +522,33 @@ add_proxy() {
     fail "Proxy name already exists: ${name}"
   fi
   id="$(generate_proxy_id "${name}")"
-  host="$(prompt_text "Add Proxy" "SOCKS5 host for ${name}." "")" || return 0
-  port="$(prompt_text "Add Proxy" "SOCKS5 port for ${name}." "1080")" || return 0
+  type_label="$(choose_from_list "Add Proxy" "Choose the upstream proxy type." "HTTP" "SOCKS5")" || return 0
+  type="${type_label:l}"
+  [[ "${type}" == "http" ]] && default_port="8080" || default_port="1080"
+  host="$(prompt_text "Add Proxy" "Proxy host for ${name}." "")" || return 0
+  port="$(prompt_text "Add Proxy" "Proxy port for ${name}." "${default_port}")" || return 0
   if ! is_valid_port "${port}"; then
     fail "Invalid proxy port: ${port}"
   fi
-  username="$(prompt_text "Add Proxy" "Optional SOCKS5 username for ${name}. Leave empty if not required." "")" || return 0
-  password="$(prompt_text "Add Proxy" "Optional SOCKS5 password for ${name}. Leave empty if not required." "")" || return 0
+  username="$(prompt_text "Add Proxy" "Optional proxy username for ${name}. Leave empty if not required." "")" || return 0
+  password="$(prompt_text "Add Proxy" "Optional proxy password for ${name}. Leave empty if not required." "")" || return 0
 
-  bridge_button="$(
+  if [[ "${type}" == "http" ]]; then
+    bridge_button="No"
+  else
+    bridge_button="$(
     /usr/bin/osascript - "${name}" <<'OSA'
 on run argv
   button returned of (display dialog "Use local HTTP bridge for " & (item 1 of argv) & "?" & return & return & "Enable this if plugin marketplace or app-server requests do not work through SOCKS5 env vars." buttons {"No", "Yes"} default button "No" with title "Add Proxy")
 end run
 OSA
-  )" || return 0
+    )" || return 0
+  fi
 
   PROXY_IDS+=("${id}")
   key="$(proxy_key "${id}")"
   typeset -g "PROXY_${key}_NAME=${name}"
+  typeset -g "PROXY_${key}_TYPE=${type}"
   typeset -g "PROXY_${key}_HOST=${host}"
   typeset -g "PROXY_${key}_PORT=${port}"
   typeset -g "PROXY_${key}_USERNAME=${username}"
@@ -522,7 +563,7 @@ OSA
 }
 
 edit_proxy() {
-  local labels=() label id key name host port username password bridge_button item
+  local labels=() label id key name type type_label current_type_label host port username password bridge_button item
 
   for item in "${PROXY_IDS[@]}"; do
     labels+=("$(proxy_label "${item}")")
@@ -538,15 +579,21 @@ edit_proxy() {
   if proxy_name_exists_except "${name}" "${id}"; then
     fail "Proxy name already exists: ${name}"
   fi
-  host="$(prompt_text "Edit Proxy" "SOCKS5 host for ${name}." "$(proxy_host "${id}")")" || return 0
-  port="$(prompt_text "Edit Proxy" "SOCKS5 port for ${name}." "$(proxy_port "${id}")")" || return 0
+  [[ "$(proxy_type "${id}")" == "http" ]] && current_type_label="HTTP" || current_type_label="SOCKS5"
+  type_label="$(choose_from_list_default "Edit Proxy" "Choose the upstream proxy type." "${current_type_label}" "HTTP" "SOCKS5")" || return 0
+  type="${type_label:l}"
+  host="$(prompt_text "Edit Proxy" "Proxy host for ${name}." "$(proxy_host "${id}")")" || return 0
+  port="$(prompt_text "Edit Proxy" "Proxy port for ${name}." "$(proxy_port "${id}")")" || return 0
   if ! is_valid_port "${port}"; then
     fail "Invalid proxy port: ${port}"
   fi
-  username="$(prompt_text "Edit Proxy" "Optional SOCKS5 username for ${name}. Leave empty if not required." "$(proxy_username "${id}")")" || return 0
-  password="$(prompt_text "Edit Proxy" "Optional SOCKS5 password for ${name}. Leave empty if not required." "$(proxy_password "${id}")")" || return 0
+  username="$(prompt_text "Edit Proxy" "Optional proxy username for ${name}. Leave empty if not required." "$(proxy_username "${id}")")" || return 0
+  password="$(prompt_text "Edit Proxy" "Optional proxy password for ${name}. Leave empty if not required." "$(proxy_password "${id}")")" || return 0
 
-  bridge_button="$(
+  if [[ "${type}" == "http" ]]; then
+    bridge_button="No"
+  else
+    bridge_button="$(
     /usr/bin/osascript - "${name}" "$(proxy_bridge "${id}")" <<'OSA'
 on run argv
   set proxyName to item 1 of argv
@@ -559,9 +606,11 @@ on run argv
   button returned of (display dialog "Use local HTTP bridge for " & proxyName & "?" buttons {"No", "Yes"} default button defaultButtonName with title "Edit Proxy")
 end run
 OSA
-  )" || return 0
+    )" || return 0
+  fi
 
   typeset -g "PROXY_${key}_NAME=${name}"
+  typeset -g "PROXY_${key}_TYPE=${type}"
   typeset -g "PROXY_${key}_HOST=${host}"
   typeset -g "PROXY_${key}_PORT=${port}"
   typeset -g "PROXY_${key}_USERNAME=${username}"
@@ -736,27 +785,36 @@ fi
 
 PROXY_HOST="$(proxy_host "${ACTIVE_PROXY}")"
 PROXY_PORT="$(proxy_port "${ACTIVE_PROXY}")"
+PROXY_TYPE="$(proxy_type "${ACTIVE_PROXY}")"
 if ! is_valid_port "${PROXY_PORT}"; then
-  fail "Invalid SOCKS5 proxy port: ${PROXY_PORT}. Use a value from 1 to 65535."
+  fail "Invalid proxy port: ${PROXY_PORT}. Use a value from 1 to 65535."
 fi
 PROXY_URL_HOST="$(proxy_url_host "${PROXY_HOST}")"
 PROXY_USERINFO="$(proxy_userinfo "${ACTIVE_PROXY}")"
-PROXY_ENV="socks5h://${PROXY_USERINFO}${PROXY_URL_HOST}:${PROXY_PORT}"
-PROXY_CHROMIUM="socks5://${PROXY_USERINFO}${PROXY_URL_HOST}:${PROXY_PORT}"
+if [[ "${PROXY_TYPE}" == "http" ]]; then
+  PROXY_ENV="http://${PROXY_USERINFO}${PROXY_URL_HOST}:${PROXY_PORT}"
+  PROXY_CHROMIUM="http://${PROXY_URL_HOST}:${PROXY_PORT}"
+  USE_BRIDGE="0"
+else
+  PROXY_ENV="socks5h://${PROXY_USERINFO}${PROXY_URL_HOST}:${PROXY_PORT}"
+  PROXY_CHROMIUM="socks5://${PROXY_USERINFO}${PROXY_URL_HOST}:${PROXY_PORT}"
+  USE_BRIDGE="$(proxy_bridge "${ACTIVE_PROXY}")"
+fi
 CHROMIUM_PROXY="${PROXY_CHROMIUM}"
 build_bypass_lists
 NO_PROXY_LIST="${BYPASS_PROXY_LIST},${PROXY_HOST}"
 HOST_RESOLVER_RULES="${CHROMIUM_HOST_RESOLVER_RULES:-}"
 log_debug "proxy host: ${PROXY_HOST}"
 log_debug "proxy port: ${PROXY_PORT}"
+log_debug "proxy type: ${PROXY_TYPE}"
 if [[ -n "$(proxy_username "${ACTIVE_PROXY}")" || -n "$(proxy_password "${ACTIVE_PROXY}")" ]]; then
   log_debug "proxy authentication: enabled"
 else
   log_debug "proxy authentication: disabled"
 fi
-log_debug "proxy bridge enabled: $(proxy_bridge "${ACTIVE_PROXY}")"
-log_debug "initial env proxy scheme: socks5h"
-log_debug "initial chromium proxy scheme: socks5"
+log_debug "proxy bridge enabled: ${USE_BRIDGE}"
+log_debug "initial env proxy scheme: ${PROXY_ENV%%:*}"
+log_debug "initial chromium proxy scheme: ${PROXY_CHROMIUM%%:*}"
 log_debug "no_proxy: ${NO_PROXY_LIST}"
 log_debug "host resolver rules: ${HOST_RESOLVER_RULES}"
 
@@ -770,9 +828,32 @@ fi
 log_debug "checking TCP connection to ${PROXY_HOST}:${PROXY_PORT}"
 if ! /usr/bin/nc -z -w 5 "${PROXY_HOST}" "${PROXY_PORT}" >/dev/null 2>&1; then
   log_debug "TCP check failed for ${PROXY_HOST}:${PROXY_PORT}"
-  fail "Cannot connect to SOCKS5 proxy ${PROXY_HOST}:${PROXY_PORT}. Choose another proxy or check that it is reachable from this Mac."
+  fail "Cannot connect to ${PROXY_TYPE:u} proxy ${PROXY_HOST}:${PROXY_PORT}. Choose another proxy or check that it is reachable from this Mac."
 fi
 log_debug "TCP check passed for ${PROXY_HOST}:${PROXY_PORT}"
+
+abort_if_launcher_gone
+if [[ "${PROXY_TYPE}" == "http" && "${USE_BRIDGE}" != "1" &&
+      "${CHATGPT_PROXY_PREFLIGHT_VERIFIED:-0}" != "1" ]]; then
+  log_debug "checking direct HTTP proxy connectivity"
+  PREFLIGHT_URL="${CHATGPT_PROXY_PREFLIGHT_URL:-https://api.openai.com/}"
+  if ! HTTP_PROXY="${PROXY_ENV}" HTTPS_PROXY="${PROXY_ENV}" ALL_PROXY="${PROXY_ENV}" \
+      http_proxy="${PROXY_ENV}" https_proxy="${PROXY_ENV}" all_proxy="${PROXY_ENV}" \
+      NO_PROXY="" no_proxy="" \
+      /usr/bin/curl \
+        --silent \
+        --show-error \
+        --output /dev/null \
+        --connect-timeout 8 \
+        --max-time 15 \
+        --noproxy "" \
+        "${PREFLIGHT_URL}" >> "${DEBUG_OUTPUT}" 2>&1; then
+    log_debug "direct HTTP proxy connectivity check failed"
+    fail "The HTTP proxy ${PROXY_HOST}:${PROXY_PORT} could not complete a real HTTPS CONNECT request. Check its authentication and upstream route."
+  fi
+  log_debug "direct HTTP proxy connectivity check passed"
+fi
+abort_if_launcher_gone
 
 chatgpt_process_pids() {
   local pid executable
@@ -846,7 +927,7 @@ cleanup_unmanaged_chatgpt_processes() {
 
 cleanup_unmanaged_chatgpt_processes
 
-if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
+if [[ "${USE_BRIDGE}" == "1" ]]; then
   BRIDGE_HOST="${HTTP_BRIDGE_HOST:-127.0.0.1}"
   BRIDGE_PORT="${HTTP_BRIDGE_PORT:-23001}"
   case "${BRIDGE_HOST}" in
@@ -874,10 +955,11 @@ if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
 
   BRIDGE_LISTEN_HOST="${BRIDGE_HOST}" \
   BRIDGE_LISTEN_PORT="${BRIDGE_PORT}" \
-  UPSTREAM_SOCKS_HOST="${PROXY_HOST}" \
-  UPSTREAM_SOCKS_PORT="${PROXY_PORT}" \
-  UPSTREAM_SOCKS_USERNAME="$(proxy_username "${ACTIVE_PROXY}")" \
-  UPSTREAM_SOCKS_PASSWORD="$(proxy_password "${ACTIVE_PROXY}")" \
+  UPSTREAM_PROXY_TYPE="${PROXY_TYPE}" \
+  UPSTREAM_PROXY_HOST="${PROXY_HOST}" \
+  UPSTREAM_PROXY_PORT="${PROXY_PORT}" \
+  UPSTREAM_PROXY_USERNAME="$(proxy_username "${ACTIVE_PROXY}")" \
+  UPSTREAM_PROXY_PASSWORD="$(proxy_password "${ACTIVE_PROXY}")" \
   BRIDGE_DEBUG="${DEBUG_ENABLED}" \
     "${BRIDGE_EXECUTABLE}" >> "${DEBUG_OUTPUT}" 2>&1 &
   BRIDGE_PID=$!
@@ -899,7 +981,7 @@ if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
   log_debug "bridge is listening on ${BRIDGE_HOST}:${BRIDGE_PORT}"
 
   # Listening alone does not prove that macOS allows this app to reach a LAN
-  # SOCKS server. Exercise one real CONNECT before opening ChatGPT so a denied
+  # upstream proxy. Exercise one real CONNECT before opening ChatGPT so a denied
   # Local Network permission fails clearly instead of producing a broken UI.
   BRIDGE_PREFLIGHT_URL="${CHATGPT_PROXY_PREFLIGHT_URL:-https://api.openai.com/}"
   log_debug "checking bridge upstream connectivity"
@@ -913,13 +995,16 @@ if [[ "$(proxy_bridge "${ACTIVE_PROXY}")" == "1" ]]; then
       --proxy "${BRIDGE_PROXY_ENV}" \
       "${BRIDGE_PREFLIGHT_URL}" >> "${DEBUG_OUTPUT}" 2>&1; then
     log_debug "bridge upstream connectivity check failed"
-    fail "The local HTTP bridge started, but SOCKS5 CONNECT through ${PROXY_HOST}:${PROXY_PORT} failed. Check local-network permission for ChatGPT Proxy when this proxy is on your LAN, then verify the SOCKS5 service and its upstream route."
+    fail "The local HTTP bridge started, but CONNECT through the ${PROXY_TYPE:u} proxy ${PROXY_HOST}:${PROXY_PORT} failed. Check authentication, local-network permission when this proxy is on your LAN, and the proxy's upstream route."
   fi
   log_debug "bridge upstream connectivity check passed"
 
   PROXY_ENV="${BRIDGE_PROXY_ENV}"
+  if [[ "${PROXY_TYPE}" == "http" ]]; then
+    CHROMIUM_PROXY="${BRIDGE_PROXY_ENV}"
+  fi
   log_debug "final env proxy after bridge: ${PROXY_ENV}"
-  log_debug "final chromium proxy remains: ${CHROMIUM_PROXY}"
+  log_debug "final chromium proxy: ${CHROMIUM_PROXY}"
 fi
 
 export ALL_PROXY="${PROXY_ENV}"
@@ -950,6 +1035,7 @@ if [[ ! -x "${CHATGPT_LAUNCH_HELPER}" ]]; then
 fi
 
 /bin/rm -f "${CHATGPT_PID_FILE}"
+abort_if_launcher_gone
 "${CHATGPT_LAUNCH_HELPER}" \
   --pid-file "${CHATGPT_PID_FILE}" \
   "${CHATGPT_APP_PATH}" \
@@ -959,6 +1045,11 @@ LAUNCH_HELPER_PID=$!
 for _ in {1..100}; do
   [[ -s "${CHATGPT_PID_FILE}" ]] && break
   /bin/kill -0 "${LAUNCH_HELPER_PID}" >/dev/null 2>&1 || break
+  if [[ "${CHATGPT_PROXY_SKIP_UI:-0}" == "1" ]] &&
+     ! /bin/kill -0 "${LAUNCHER_PID}" >/dev/null 2>&1; then
+    /bin/kill -TERM "${LAUNCH_HELPER_PID}" >/dev/null 2>&1 || true
+    exit 143
+  fi
   sleep 0.1
 done
 if [[ ! -s "${CHATGPT_PID_FILE}" ]]; then
@@ -991,7 +1082,43 @@ done
 
 if [[ "${OPEN_STATUS}" -eq 0 ]]; then
   log_debug "waiting for ChatGPT main process ${CHATGPT_MAIN_PID} through LaunchServices helper ${LAUNCH_HELPER_PID}"
-  wait "${LAUNCH_HELPER_PID}" || OPEN_STATUS=$?
+  if [[ "${CHATGPT_PROXY_SKIP_UI:-0}" == "1" ]]; then
+    (
+      while /bin/kill -0 "${LAUNCHER_PID}" >/dev/null 2>&1 &&
+            /bin/kill -0 "${LAUNCH_HELPER_PID}" >/dev/null 2>&1; do
+        sleep 0.5
+      done
+      if ! /bin/kill -0 "${LAUNCHER_PID}" >/dev/null 2>&1; then
+        /bin/kill -TERM "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || true
+        for _ in {1..20}; do
+          /bin/kill -0 "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || break
+          sleep 0.1
+        done
+        if /bin/kill -0 "${CHATGPT_MAIN_PID}" >/dev/null 2>&1; then
+          /bin/kill -KILL "${CHATGPT_MAIN_PID}" >/dev/null 2>&1 || true
+        fi
+        /bin/kill -TERM "${LAUNCH_HELPER_PID}" >/dev/null 2>&1 || true
+      fi
+    ) &
+    WATCHDOG_PID=$!
+  fi
+  if wait "${LAUNCH_HELPER_PID}"; then
+    HELPER_STATUS=0
+  else
+    HELPER_STATUS=$?
+  fi
+  if [[ -n "${WATCHDOG_PID}" ]]; then
+    /bin/kill -TERM "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+    wait "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+    WATCHDOG_PID=""
+  fi
+  if [[ "${CHATGPT_PROXY_SKIP_UI:-0}" == "1" ]] &&
+     ! /bin/kill -0 "${LAUNCHER_PID}" >/dev/null 2>&1; then
+    OPEN_STATUS=143
+  fi
+  if [[ "${OPEN_STATUS}" -eq 0 ]]; then
+    OPEN_STATUS="${HELPER_STATUS}"
+  fi
   log_debug "ChatGPT main process exited with status ${OPEN_STATUS}"
 fi
 

@@ -4,23 +4,25 @@ ACTIVE_PROXY="local"
 # ChatGPT application bundle. Paths containing spaces are supported.
 CHATGPT_APP_PATH="/Applications/ChatGPT.app"
 
-# Configured SOCKS5 proxies.
+# Configured proxy profiles. TYPE supports "socks5" and "http".
 PROXY_IDS=(local remote)
 PROXY_LOCAL_NAME="Local SOCKS"
+PROXY_LOCAL_TYPE="socks5"
 PROXY_LOCAL_HOST="127.0.0.1"
 PROXY_LOCAL_PORT="1080"
 PROXY_LOCAL_USERNAME=""
 PROXY_LOCAL_PASSWORD=""
 PROXY_LOCAL_HTTP_BRIDGE="1"
 
-PROXY_REMOTE_NAME="Remote SOCKS"
+PROXY_REMOTE_NAME="Remote HTTP"
+PROXY_REMOTE_TYPE="http"
 PROXY_REMOTE_HOST="proxy.example.com"
-PROXY_REMOTE_PORT="1080"
+PROXY_REMOTE_PORT="8080"
 PROXY_REMOTE_USERNAME=""
 PROXY_REMOTE_PASSWORD=""
-PROXY_REMOTE_HTTP_BRIDGE="1"
+PROXY_REMOTE_HTTP_BRIDGE="0"
 
-# Local HTTP CONNECT bridge used when a proxy enables HTTP bridge mode.
+# Local HTTP CONNECT bridge used only by SOCKS5 profiles.
 HTTP_BRIDGE_HOST="127.0.0.1"
 HTTP_BRIDGE_PORT="23001"
 

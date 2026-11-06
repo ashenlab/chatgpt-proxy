@@ -7,8 +7,8 @@ APP="${OUTPUT_DIR}/ChatGPT Proxy.app"
 CONTENTS="${APP}/Contents"
 RESOURCES="${CONTENTS}/Resources"
 MACOS="${CONTENTS}/MacOS"
-VERSION="2.1.12"
-BUILD="36"
+VERSION="2.2.0"
+BUILD="42"
 DEPLOYMENT_TARGET="12.0"
 MODULE_CACHE="${CHATGPT_PROXY_MODULE_CACHE_PATH:-${TMPDIR:-/tmp}/chatgpt-proxy-module-cache}"
 
@@ -63,7 +63,7 @@ cat > "${CONTENTS}/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>${BUILD}</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSLocalNetworkUsageDescription</key><string>ChatGPT Proxy connects to your local SOCKS5 proxy to start ChatGPT with per-app proxy settings.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>ChatGPT Proxy connects to your local SOCKS5 or HTTP proxy to start ChatGPT with per-app proxy settings.</string>
 </dict></plist>
 PLIST
 

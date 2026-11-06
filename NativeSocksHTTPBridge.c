@@ -25,6 +25,7 @@ static const char *upstream_host;
 static const char *upstream_port;
 static const char *upstream_username;
 static const char *upstream_password;
+static const char *upstream_type;
 static bool debug_enabled;
 static volatile sig_atomic_t should_stop;
 static unsigned int handshake_timeout_seconds = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS;
@@ -268,6 +269,145 @@ static bool socks_connect(int fd, const char *target_host, uint16_t target_port)
   return receive_exact(fd, discard, address_length + 2);
 }
 
+static char *base64_encode(const uint8_t *input, size_t length) {
+  static const char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t output_length = 4 * ((length + 2) / 3);
+  char *output = malloc(output_length + 1);
+  if (output == NULL) return NULL;
+
+  size_t input_index = 0;
+  size_t output_index = 0;
+  while (input_index < length) {
+    uint32_t first = input[input_index++];
+    uint32_t second = input_index < length ? input[input_index++] : 0;
+    uint32_t third = input_index < length ? input[input_index++] : 0;
+    uint32_t value = (first << 16) | (second << 8) | third;
+    output[output_index++] = alphabet[(value >> 18) & 0x3f];
+    output[output_index++] = alphabet[(value >> 12) & 0x3f];
+    output[output_index++] = alphabet[(value >> 6) & 0x3f];
+    output[output_index++] = alphabet[value & 0x3f];
+  }
+  if (length % 3 == 1) {
+    output[output_length - 2] = '=';
+    output[output_length - 1] = '=';
+  } else if (length % 3 == 2) {
+    output[output_length - 1] = '=';
+  }
+  output[output_length] = '\0';
+  return output;
+}
+
+static bool http_proxy_connect(int fd, const char *target_host, uint16_t target_port) {
+  bool needs_auth = upstream_username[0] != '\0' || upstream_password[0] != '\0';
+  size_t credentials_length = strlen(upstream_username) + strlen(upstream_password) + 1;
+  char *credentials = NULL;
+  char *encoded_credentials = NULL;
+  if (needs_auth) {
+    credentials = malloc(credentials_length + 1);
+    if (credentials == NULL) return false;
+    snprintf(credentials, credentials_length + 1, "%s:%s", upstream_username, upstream_password);
+    encoded_credentials = base64_encode((const uint8_t *)credentials, credentials_length);
+    free(credentials);
+    if (encoded_credentials == NULL) return false;
+  }
+
+  bool ipv6_target = strchr(target_host, ':') != NULL;
+  size_t request_capacity = strlen(target_host) * 2 +
+      (encoded_credentials == NULL ? 0 : strlen(encoded_credentials)) + 256;
+  char *request = malloc(request_capacity);
+  if (request == NULL) {
+    free(encoded_credentials);
+    return false;
+  }
+  const char *authorization_prefix = needs_auth ? "Proxy-Authorization: Basic " : "";
+  const char *authorization_value = needs_auth ? encoded_credentials : "";
+  const char *authorization_suffix = needs_auth ? "\r\n" : "";
+  int request_length = snprintf(
+      request, request_capacity,
+      ipv6_target
+          ? "CONNECT [%s]:%u HTTP/1.1\r\nHost: [%s]:%u\r\n%s%s%sProxy-Connection: Keep-Alive\r\n\r\n"
+          : "CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\n%s%s%sProxy-Connection: Keep-Alive\r\n\r\n",
+      target_host, target_port, target_host, target_port,
+      authorization_prefix, authorization_value, authorization_suffix);
+  free(encoded_credentials);
+  if (request_length < 0 || (size_t)request_length >= request_capacity ||
+      !send_all(fd, request, (size_t)request_length)) {
+    free(request);
+    debug_log("HTTP proxy CONNECT request failed");
+    return false;
+  }
+  free(request);
+
+  char response[HEADER_LIMIT + 1];
+  size_t used = 0;
+  while (used < HEADER_LIMIT) {
+    ssize_t received = recv(fd, response + used, 1, 0);
+    if (received < 0 && errno == EINTR) continue;
+    if (received <= 0) {
+      debug_log("HTTP proxy closed during CONNECT response");
+      return false;
+    }
+    used++;
+    if (used >= 4 && memcmp(response + used - 4, "\r\n\r\n", 4) == 0) break;
+  }
+  if (used < 4 || memcmp(response + used - 4, "\r\n\r\n", 4) != 0) {
+    debug_log("HTTP proxy CONNECT response header is too large");
+    return false;
+  }
+  response[used] = '\0';
+  int major = 0;
+  int minor = 0;
+  int status = 0;
+  if (sscanf(response, "HTTP/%d.%d %d", &major, &minor, &status) != 3 ||
+      status < 200 || status >= 300) {
+    debug_log("HTTP proxy CONNECT failed with status %d", status);
+    return false;
+  }
+  return true;
+}
+
+static bool http_proxy_forward_request(int fd, const uint8_t *request,
+                                       size_t header_length) {
+  bool needs_auth = upstream_username[0] != '\0' || upstream_password[0] != '\0';
+  if (!needs_auth) return send_all(fd, request, header_length);
+  if (header_length < 4) return false;
+
+  size_t credentials_length = strlen(upstream_username) + strlen(upstream_password) + 1;
+  char *credentials = malloc(credentials_length + 1);
+  if (credentials == NULL) return false;
+  snprintf(credentials, credentials_length + 1, "%s:%s", upstream_username, upstream_password);
+  char *encoded_credentials = base64_encode((const uint8_t *)credentials, credentials_length);
+  free(credentials);
+  if (encoded_credentials == NULL) return false;
+
+  size_t header_prefix_length = header_length - 2;
+  size_t authorization_capacity = strlen(encoded_credentials) + 128;
+  char *authorization = malloc(authorization_capacity);
+  if (authorization == NULL) {
+    free(encoded_credentials);
+    return false;
+  }
+  int authorization_length = snprintf(
+      authorization, authorization_capacity,
+      "Proxy-Authorization: Basic %s\r\nProxy-Connection: close\r\nConnection: close\r\n\r\n",
+      encoded_credentials);
+  free(encoded_credentials);
+  bool success = authorization_length > 0 &&
+      (size_t)authorization_length < authorization_capacity &&
+      send_all(fd, request, header_prefix_length) &&
+      send_all(fd, authorization, (size_t)authorization_length);
+  free(authorization);
+  return success;
+}
+
+static bool upstream_connect(int fd, const char *target_host, uint16_t target_port) {
+  if (strcmp(upstream_type, "http") == 0) {
+    return http_proxy_connect(fd, target_host, target_port);
+  }
+  return socks_connect(fd, target_host, target_port);
+}
+
 static bool parse_connect_request(const uint8_t *buffer, size_t length,
                                   char **host, uint16_t *port, size_t *header_length) {
   const char *text = (const char *)buffer;
@@ -364,30 +504,56 @@ static void *handle_client(void *argument) {
   char *target_host = NULL;
   uint16_t target_port = 0;
   size_t header_length = 0;
+  bool forward_http_request = false;
 
   while (used < sizeof(request)) {
     ssize_t received = recv(client_fd, request + used, sizeof(request) - used, 0);
     if (received <= 0) goto finish;
     used += (size_t)received;
     if (parse_connect_request(request, used, &target_host, &target_port, &header_length)) break;
-    if (used >= 4 && memmem(request, used, "\r\n\r\n", 4) != NULL) {
+    void *header_end = used >= 4 ? memmem(request, used, "\r\n\r\n", 4) : NULL;
+    if (header_end != NULL && strcmp(upstream_type, "http") == 0) {
+      header_length = (size_t)((uint8_t *)header_end - request) + 4;
+      forward_http_request = true;
+      break;
+    }
+    if (header_end != NULL) {
       write_http_error(client_fd, 400, "Bad Request");
       goto finish;
     }
   }
-  if (target_host == NULL) {
+  if (target_host == NULL && !forward_http_request) {
     write_http_error(client_fd, 400, "Bad Request");
     goto finish;
   }
 
-  debug_log("CONNECT %s:%u via %s:%s", target_host, target_port, upstream_host, upstream_port);
+  if (forward_http_request) {
+    debug_log("forwarding HTTP request via %s:%s", upstream_host, upstream_port);
+    int upstream_fd = connect_tcp(upstream_host, upstream_port);
+    if (upstream_fd < 0 ||
+        !http_proxy_forward_request(upstream_fd, request, header_length) ||
+        (used > header_length &&
+         !send_all(upstream_fd, request + header_length, used - header_length))) {
+      write_http_error(client_fd, 502, "Bad Gateway");
+      close_fd(&upstream_fd);
+      goto finish;
+    }
+    clear_socket_timeout(client_fd);
+    clear_socket_timeout(upstream_fd);
+    relay(client_fd, upstream_fd);
+    close_fd(&upstream_fd);
+    goto finish;
+  }
+
+  debug_log("CONNECT %s:%u via %s %s:%s", target_host, target_port,
+            upstream_type, upstream_host, upstream_port);
   int upstream_fd = connect_tcp(upstream_host, upstream_port);
-  if (upstream_fd < 0 || !socks_connect(upstream_fd, target_host, target_port)) {
+  if (upstream_fd < 0 || !upstream_connect(upstream_fd, target_host, target_port)) {
     write_http_error(client_fd, 502, "Bad Gateway");
     close_fd(&upstream_fd);
     goto finish;
   }
-  debug_log("SOCKS connected %s:%u", target_host, target_port);
+  debug_log("upstream proxy connected %s:%u", target_host, target_port);
   const char established[] = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: chatgpt-proxy\r\n\r\n";
   if (!send_all(client_fd, established, sizeof(established) - 1)) {
     close_fd(&upstream_fd);
@@ -438,10 +604,16 @@ static void signal_handler(int signal_number) {
 int main(void) {
   const char *listen_host = getenv("BRIDGE_LISTEN_HOST");
   const char *listen_port = getenv("BRIDGE_LISTEN_PORT");
-  upstream_host = getenv("UPSTREAM_SOCKS_HOST");
-  upstream_port = getenv("UPSTREAM_SOCKS_PORT");
-  upstream_username = getenv("UPSTREAM_SOCKS_USERNAME");
-  upstream_password = getenv("UPSTREAM_SOCKS_PASSWORD");
+  upstream_type = getenv("UPSTREAM_PROXY_TYPE");
+  upstream_host = getenv("UPSTREAM_PROXY_HOST");
+  upstream_port = getenv("UPSTREAM_PROXY_PORT");
+  upstream_username = getenv("UPSTREAM_PROXY_USERNAME");
+  upstream_password = getenv("UPSTREAM_PROXY_PASSWORD");
+  if (upstream_type == NULL) upstream_type = "socks5";
+  if (upstream_host == NULL) upstream_host = getenv("UPSTREAM_SOCKS_HOST");
+  if (upstream_port == NULL) upstream_port = getenv("UPSTREAM_SOCKS_PORT");
+  if (upstream_username == NULL) upstream_username = getenv("UPSTREAM_SOCKS_USERNAME");
+  if (upstream_password == NULL) upstream_password = getenv("UPSTREAM_SOCKS_PASSWORD");
   const char *debug_value = getenv("BRIDGE_DEBUG");
   debug_enabled = debug_value != NULL && strcmp(debug_value, "1") == 0;
   handshake_timeout_seconds = positive_env_value(
@@ -455,6 +627,10 @@ int main(void) {
   }
   if (upstream_username == NULL) upstream_username = "";
   if (upstream_password == NULL) upstream_password = "";
+  if (strcmp(upstream_type, "socks5") != 0 && strcmp(upstream_type, "http") != 0) {
+    fputs("[bridge] unsupported upstream proxy type\n", stderr);
+    return 2;
+  }
   if (strcmp(listen_host, "localhost") == 0) listen_host = "127.0.0.1";
 
   int listener_fd = create_listener(listen_host, listen_port);
