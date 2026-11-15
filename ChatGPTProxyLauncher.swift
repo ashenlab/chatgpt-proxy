@@ -358,6 +358,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     private let versionLabel = NSTextField(labelWithString: "")
     private let subtitleLabel = NSTextField(labelWithString: "")
     private let languageMenu = NSPopUpButton()
+    private let menuBarModeMenuItem = NSMenuItem()
+    private let statusModeMenuItem = NSMenuItem()
+    private var menuBarMode = UserDefaults.standard.bool(forKey: "MenuBarMode")
+    private var statusItem: NSStatusItem?
+    private let showConfigurationMenuItem = NSMenuItem()
+    private let statusReportMenuItem = NSMenuItem()
+    private let statusQuitMenuItem = NSMenuItem()
     private let applicationMenuItem = NSMenuItem()
     private let quitApplicationMenuItem = NSMenuItem()
     private let proxyTabItem = NSTabViewItem(identifier: "proxies")
@@ -409,12 +416,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         buildMainMenu()
         buildWindow()
         reloadAll()
+        applyMenuBarMode()
         window.center()
         showConfigurationWindow(reloadConfiguration: false)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        launchProcess == nil
+        !menuBarMode && launchProcess == nil
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -480,7 +488,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        if !window.isVisible {
+        if let statusWindow {
+            if statusWindow.isMiniaturized { statusWindow.deminiaturize(nil) }
+            statusWindow.makeKeyAndOrderFront(nil)
+            statusWindow.orderFrontRegardless()
+        } else if !window.isVisible && !menuBarMode {
             showConfigurationWindow()
         }
     }
@@ -491,6 +503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     }
 
     private func showConfigurationWindow(reloadConfiguration: Bool = true) {
+        NSApp.setActivationPolicy(.regular)
         if reloadConfiguration {
             config = store.load()
             reloadAll()
@@ -509,6 +522,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "title": "ChatGPT Proxy",
             "subtitle": "Choose a proxy, tune direct-connect bypasses, then launch ChatGPT.",
             "language": "Language",
+            "menuBarMode": "Hide in menu bar",
+            "openConfiguration": "Open Configuration…",
             "proxies": "Proxies",
             "bypass": "Bypass",
             "setCurrent": "Set Current",
@@ -582,6 +597,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             "title": "ChatGPT Proxy",
             "subtitle": "选择代理、配置直连排除项，然后启动 ChatGPT。",
             "language": "语言",
+            "menuBarMode": "隐藏到菜单栏",
+            "openConfiguration": "打开配置…",
             "proxies": "代理",
             "bypass": "直连排除",
             "setCurrent": "设为当前",
@@ -659,6 +676,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         applicationMenuItem.title = tr("title")
         applicationMenuItem.submenu?.title = tr("title")
         quitApplicationMenuItem.title = tr("quitApplication")
+        menuBarModeMenuItem.title = tr("menuBarMode")
+        statusModeMenuItem.title = tr("menuBarMode")
+        showConfigurationMenuItem.title = tr("openConfiguration")
+        statusReportMenuItem.title = tr("inspectStatus")
+        statusQuitMenuItem.title = tr("quitApplication")
         titleLabel.stringValue = tr("title")
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         versionLabel.stringValue = version.map { "v\($0)" } ?? ""
@@ -696,6 +718,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
         applicationMenuItem.submenu = applicationMenu
         mainMenu.addItem(applicationMenuItem)
 
+        menuBarModeMenuItem.target = self
+        menuBarModeMenuItem.action = #selector(menuBarModeChanged)
+        applicationMenu.addItem(menuBarModeMenuItem)
+        applicationMenu.addItem(.separator())
+
         quitApplicationMenuItem.target = NSApp
         quitApplicationMenuItem.action = #selector(NSApplication.terminate(_:))
         quitApplicationMenuItem.keyEquivalent = "q"
@@ -705,6 +732,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
 
     private func buildWindow() {
         window.isReleasedWhenClosed = false
+        window.delegate = self
         window.collectionBehavior.insert(.moveToActiveSpace)
 
         let root = NSStackView()
@@ -1159,10 +1187,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     }
 
     @objc private func cancelClicked() {
-        if launchProcess == nil {
+        if launchProcess == nil && !menuBarMode {
             NSApp.terminate(nil)
         } else {
             window.orderOut(nil)
+            updateWindowActivationPolicy()
+        }
+    }
+
+    @objc private func menuBarModeChanged() {
+        menuBarMode.toggle()
+        UserDefaults.standard.set(menuBarMode, forKey: "MenuBarMode")
+        applyMenuBarMode()
+        showConfigurationWindow(reloadConfiguration: false)
+    }
+
+    private func applyMenuBarMode() {
+        menuBarModeMenuItem.state = menuBarMode ? .on : .off
+        statusModeMenuItem.state = menuBarMode ? .on : .off
+        if menuBarMode {
+            if statusItem == nil {
+                let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+                item.button?.image = ProxyMenuBarIcon.make()
+                item.button?.toolTip = "ChatGPT Proxy"
+                let menu = NSMenu()
+                showConfigurationMenuItem.target = self
+                showConfigurationMenuItem.action = #selector(openConfigurationFromMenu)
+                statusReportMenuItem.target = self
+                statusReportMenuItem.action = #selector(openStatusFromMenu)
+                statusQuitMenuItem.target = NSApp
+                statusQuitMenuItem.action = #selector(NSApplication.terminate(_:))
+                menu.addItem(showConfigurationMenuItem)
+                menu.addItem(statusReportMenuItem)
+                menu.addItem(.separator())
+                statusModeMenuItem.target = self
+                statusModeMenuItem.action = #selector(menuBarModeChanged)
+                menu.addItem(statusModeMenuItem)
+                menu.addItem(.separator())
+                menu.addItem(statusQuitMenuItem)
+                item.menu = menu
+                statusItem = item
+            }
+            updateWindowActivationPolicy()
+        } else {
+            NSApp.setActivationPolicy(.regular)
+            if let statusItem {
+                NSStatusBar.system.removeStatusItem(statusItem)
+                self.statusItem = nil
+            }
+        }
+    }
+
+    @objc private func openConfigurationFromMenu() {
+        showConfigurationWindow()
+    }
+
+    private func updateWindowActivationPolicy() {
+        let hasVisibleWindow = window.isVisible || statusWindow?.isVisible == true
+        NSApp.setActivationPolicy(menuBarMode && !hasVisibleWindow ? .accessory : .regular)
+    }
+
+    @objc private func openStatusFromMenu() {
+        // Present after status-menu tracking ends so activation cannot obscure it.
+        DispatchQueue.main.async { [weak self] in
+            self?.inspectStatusClicked()
         }
     }
 
@@ -1178,7 +1266,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     }
 
     @objc private func inspectStatusClicked() {
+        NSApp.setActivationPolicy(.regular)
         if let statusWindow, statusWindow.isVisible {
+            if statusWindow.isMiniaturized { statusWindow.deminiaturize(nil) }
             NSApp.activate(ignoringOtherApps: true)
             statusWindow.makeKeyAndOrderFront(nil)
             statusWindow.orderFrontRegardless()
@@ -1273,7 +1363,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     }
 
     func windowWillClose(_ notification: Notification) {
-        guard let closedWindow = notification.object as? NSWindow, closedWindow === statusWindow else { return }
+        guard let closedWindow = notification.object as? NSWindow else { return }
+        if closedWindow === window || closedWindow === statusWindow {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateWindowActivationPolicy()
+            }
+        }
+        guard closedWindow === statusWindow else { return }
         statusWindow = nil
         statusTextView = nil
         statusCopyButton = nil
@@ -1617,13 +1713,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             isLaunchScriptCommand($0.command, scriptPath: input.scriptPath)
         }
         let bridgeProcesses = processes.filter { $0.command.hasPrefix(input.bridgePath) }
+        let managedScriptPIDs = SessionProcessOwnership.managedScriptPIDs(
+            currentScriptPID: input.currentScriptPID,
+            launcherPID: input.launcherPID,
+            scripts: scriptProcesses
+        )
         var scriptPIDs = Set(scriptProcesses.map(\.pid))
         if let currentScriptPID = input.currentScriptPID {
             scriptPIDs.insert(currentScriptPID)
         }
         var findings: [String] = []
 
-        for process in scriptProcesses where process.pid != input.currentScriptPID {
+        for process in scriptProcesses where !managedScriptPIDs.contains(process.pid) {
             findings.append(chinese
                 ? "发现当前启动器之外的 ChatGPT Proxy 启动脚本：PID \(process.pid)，PPID \(process.ppid)。"
                 : "Additional ChatGPT Proxy launch script: PID \(process.pid), PPID \(process.ppid).")
@@ -2123,6 +2224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
             managedChatGPTPID = pid
             statusLabel.stringValue = ""
             window.orderOut(nil)
+            updateWindowActivationPolicy()
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak process] in
@@ -2263,7 +2365,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTa
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+@main
+enum ChatGPTProxyMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        withExtendedLifetime(delegate) { app.run() }
+    }
+}

@@ -7,8 +7,8 @@ APP="${OUTPUT_DIR}/ChatGPT Proxy.app"
 CONTENTS="${APP}/Contents"
 RESOURCES="${CONTENTS}/Resources"
 MACOS="${CONTENTS}/MacOS"
-VERSION="2.2.0"
-BUILD="42"
+VERSION="2.2.1"
+BUILD="47"
 DEPLOYMENT_TARGET="12.0"
 MODULE_CACHE="${CHATGPT_PROXY_MODULE_CACHE_PATH:-${TMPDIR:-/tmp}/chatgpt-proxy-module-cache}"
 
@@ -24,6 +24,8 @@ mkdir -p "${MACOS}" "${RESOURCES}" "${MODULE_CACHE}"
   -module-cache-path "${MODULE_CACHE}" \
   -framework AppKit \
   "${ROOT}/ChatGPTProxyLauncher.swift" \
+  "${ROOT}/ProxyMenuBarIcon.swift" \
+  "${ROOT}/SessionProcessOwnership.swift" \
   -o "${MACOS}/ChatGPTProxyLauncher"
 
 /usr/bin/swiftc -O -target "arm64-apple-macosx${DEPLOYMENT_TARGET}" \

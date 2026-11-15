@@ -19,10 +19,13 @@ ChatGPT Proxy 只在启动 ChatGPT 时注入代理环境变量与 Chromium 代�
 - 可配置直连排除项，包括本机、局域网、域名、IP 和 CIDR。
 - 新建 SOCKS5 配置默认启用本地 HTTP CONNECT bridge；HTTP 配置始终直接连接且不显示 bridge 设置。
 - 原生 AppKit 界面，支持英文/中文快速切换。
+- 在左上角 `ChatGPT Proxy` 应用菜单中可勾选“隐藏到菜单栏”：隐藏 Dock 图标，通过菜单栏打开配置、查询当前状态或退出；关闭配置窗口不会结束代理会话。该偏好会自动保存，默认关闭；右上角图标菜单也可取消勾选以恢复 Dock 图标。
 - 界面直接显示当前应用版本号，便于确认本机与 Release 版本一致。
 - 当 ChatGPT 已运行时提示退出并重新启动，避免代理配置未真正生效。
 
 ## 要求
+
+菜单栏模式下，配置或状态窗口打开时会临时显示 Dock 图标和左上角应用菜单；所有窗口隐藏或关闭后，再隐藏 Dock 图标并保留右上角菜单栏入口。
 
 - Apple Silicon Mac（当前发布包为 `arm64`）。
 - macOS 12 或更高版本，与当前 ChatGPT Desktop 的最低系统要求一致。
@@ -131,9 +134,12 @@ ChatGPT Proxy is a native macOS launcher that starts **ChatGPT Desktop** with pe
 - Editable direct-connect bypass rules for hosts, domains, IP addresses, and CIDRs.
 - New SOCKS5 profiles enable the local HTTP CONNECT bridge by default; HTTP profiles always keep it off and hide its settings.
 - English/Chinese UI switching and a prompt to quit and relaunch ChatGPT when needed.
+- Select **Hide in menu bar** in the top-left **ChatGPT Proxy** application menu to hide the Dock icon and access configuration, current status, and quit actions from the menu bar. Closing the configuration window keeps the app running. This preference is saved automatically and is off by default. The status-icon menu also lets you turn this mode off to restore the Dock icon.
 - The current app version is shown directly in the launcher UI.
 
 ### Requirements
+
+In menu-bar mode, opening the configuration or status window temporarily restores the Dock icon and application menu. Hiding or closing all windows hides the Dock icon again while keeping the status-bar entry available.
 
 - An Apple Silicon Mac (the current release is `arm64`).
 - macOS 12 or later, matching the current ChatGPT Desktop minimum requirement.
